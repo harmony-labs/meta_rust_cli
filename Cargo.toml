@@ -12,5 +12,5 @@ crate-type = ["cdylib"]
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
-colored = "2"
+colored = "3"
 meta_plugin_api = { path = "../meta_plugin_api" }
