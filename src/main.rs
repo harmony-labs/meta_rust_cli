@@ -53,10 +53,7 @@ fn main() -> Result<()> {
             let info = PluginInfo {
                 name: "rust".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
-                commands: vec![
-                    "cargo build".to_string(),
-                    "cargo test".to_string(),
-                ],
+                commands: vec!["cargo build".to_string(), "cargo test".to_string()],
                 description: Some("Rust/Cargo commands for meta repositories".to_string()),
             };
             println!("{}", serde_json::to_string(&info)?);
@@ -77,7 +74,7 @@ fn main() -> Result<()> {
             let result = meta_rust_cli::execute_command(&request.command, &request.args);
 
             if let Err(e) = result {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e}");
                 std::process::exit(1);
             }
         }
