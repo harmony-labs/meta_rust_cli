@@ -45,6 +45,7 @@ impl Plugin for RustPlugin {
 }
 
 #[no_mangle]
+#[allow(improper_ctypes_definitions)]
 pub extern "C" fn _plugin_create() -> *mut dyn Plugin {
     Box::into_raw(Box::new(RustPlugin))
 }
