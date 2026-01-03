@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::{self, Read};
 
 /// Plugin info returned by --meta-plugin-info
@@ -13,6 +14,16 @@ struct PluginInfo {
     version: String,
     commands: Vec<String>,
     description: Option<String>,
+    help: Option<PluginHelp>,
+}
+
+/// Help information for the plugin
+#[derive(Debug, Serialize)]
+struct PluginHelp {
+    usage: String,
+    commands: HashMap<String, String>,
+    examples: Vec<String>,
+    note: Option<String>,
 }
 
 /// Request received from meta CLI via --meta-plugin-exec
@@ -50,11 +61,33 @@ fn main() -> Result<()> {
 
     match args[1].as_str() {
         "--meta-plugin-info" => {
+            let mut help_commands = HashMap::new();
+            help_commands.insert(
+                "build".to_string(),
+                "Build all Rust projects in the workspace".to_string(),
+            );
+            help_commands.insert(
+                "test".to_string(),
+                "Run tests across all Rust projects".to_string(),
+            );
+
             let info = PluginInfo {
                 name: "rust".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 commands: vec!["cargo build".to_string(), "cargo test".to_string()],
                 description: Some("Rust/Cargo commands for meta repositories".to_string()),
+                help: Some(PluginHelp {
+                    usage: "meta cargo <command> [args...]".to_string(),
+                    commands: help_commands,
+                    examples: vec![
+                        "meta cargo build".to_string(),
+                        "meta cargo test".to_string(),
+                        "meta cargo build --release".to_string(),
+                    ],
+                    note: Some(
+                        "To run raw cargo commands: meta exec -- cargo <command>".to_string(),
+                    ),
+                }),
             };
             println!("{}", serde_json::to_string(&info)?);
         }
