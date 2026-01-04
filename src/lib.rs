@@ -52,7 +52,19 @@ pub enum CommandResult {
 }
 
 /// Get all project directories from .meta config (including root ".")
-fn get_project_directories() -> anyhow::Result<Vec<String>> {
+/// If provided_projects is not empty, uses that list instead (for --recursive support)
+fn get_project_directories(provided_projects: &[String]) -> anyhow::Result<Vec<String>> {
+    // If we have provided projects from meta_cli (e.g., when --recursive is used), use them
+    if !provided_projects.is_empty() {
+        // Include root "." plus all provided project paths
+        let mut dirs = vec![".".to_string()];
+        for p in provided_projects {
+            dirs.push(p.clone());
+        }
+        return Ok(dirs);
+    }
+
+    // Fall back to reading the local .meta file
     let cwd = std::env::current_dir()?;
     let meta_path = cwd.join(".meta");
 
@@ -92,9 +104,17 @@ fn filter_rust_projects(dirs: &[String]) -> Vec<String> {
 }
 
 /// Execute a Rust/Cargo command and return the result
-pub fn execute_command(command: &str, args: &[String], parallel: bool) -> CommandResult {
+///
+/// If `provided_projects` is not empty, it will be used instead of reading from .meta file.
+/// This allows meta_cli to pass in the full project list when --recursive is used.
+pub fn execute_command(
+    command: &str,
+    args: &[String],
+    parallel: bool,
+    provided_projects: &[String],
+) -> CommandResult {
     // Get all project directories
-    let dirs = match get_project_directories() {
+    let dirs = match get_project_directories(provided_projects) {
         Ok(d) => d,
         Err(e) => return CommandResult::Error(format!("Failed to get project directories: {e}")),
     };
@@ -159,7 +179,7 @@ mod tests {
 
     #[test]
     fn test_unknown_command() {
-        let result = execute_command("cargo unknown", &[], false);
+        let result = execute_command("cargo unknown", &[], false, &[]);
         match result {
             CommandResult::Error(msg) => assert!(msg.contains("Unknown command")),
             _ => panic!("Expected Error result"),
@@ -183,7 +203,7 @@ mod tests {
 
         std::env::set_current_dir(temp_dir.path()).unwrap();
 
-        let result = execute_command("cargo build", &[], false);
+        let result = execute_command("cargo build", &[], false, &[]);
 
         std::env::set_current_dir(original_dir).unwrap();
 
@@ -204,7 +224,7 @@ mod tests {
 
         std::env::set_current_dir(temp_dir.path()).unwrap();
 
-        let result = execute_command("cargo build", &["--release".to_string()], true);
+        let result = execute_command("cargo build", &["--release".to_string()], true, &[]);
 
         std::env::set_current_dir(original_dir).unwrap();
 
