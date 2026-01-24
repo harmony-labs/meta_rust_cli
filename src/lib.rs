@@ -2,54 +2,9 @@
 //!
 //! Provides Rust/Cargo commands for meta repositories.
 
-use serde::Serialize;
-
-// ============================================================================
-// Execution Plan Types (for subprocess plugin protocol)
-// ============================================================================
-
-/// An execution plan that tells the shim what commands to run via loop_lib
-#[derive(Debug, Serialize)]
-pub struct ExecutionPlan {
-    pub commands: Vec<PlannedCommand>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parallel: Option<bool>,
-}
-
-/// A single command in an execution plan
-#[derive(Debug, Serialize)]
-pub struct PlannedCommand {
-    pub dir: String,
-    pub cmd: String,
-}
-
-/// Response wrapper for execution plans
-#[derive(Debug, Serialize)]
-pub struct PlanResponse {
-    pub plan: ExecutionPlan,
-}
-
-/// Output an execution plan to stdout for the shim to execute
-pub fn output_execution_plan(commands: Vec<PlannedCommand>, parallel: Option<bool>) {
-    let response = PlanResponse {
-        plan: ExecutionPlan { commands, parallel },
-    };
-    println!("{}", serde_json::to_string(&response).unwrap());
-}
-
-// ============================================================================
-// Command Result Types
-// ============================================================================
-
-/// Result of executing a cargo command
-pub enum CommandResult {
-    /// A plan of commands to execute via loop_lib
-    Plan(Vec<PlannedCommand>, Option<bool>),
-    /// A message to display (no commands to execute)
-    Message(String),
-    /// An error occurred
-    Error(String),
-}
+pub use meta_plugin_protocol::{
+    CommandResult, ExecutionPlan, PlannedCommand, PlanResponse, output_execution_plan,
+};
 
 /// Get all project directories from .meta config (including root ".")
 /// If provided_projects is not empty, uses that list instead (for --recursive support)
