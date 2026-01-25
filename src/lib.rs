@@ -99,7 +99,7 @@ pub fn execute_command(
             }
             cmd
         }
-        _ => return CommandResult::Error(format!("Unknown command: {}", command)),
+        _ => return CommandResult::ShowHelp(Some(format!("unrecognized command '{}'", command))),
     };
 
     // Build execution plan
@@ -136,8 +136,8 @@ mod tests {
     fn test_unknown_command() {
         let result = execute_command("cargo unknown", &[], false, &[]);
         match result {
-            CommandResult::Error(msg) => assert!(msg.contains("Unknown command")),
-            _ => panic!("Expected Error result"),
+            CommandResult::ShowHelp(Some(msg)) => assert!(msg.contains("unrecognized command")),
+            _ => panic!("Expected ShowHelp result"),
         }
     }
 
