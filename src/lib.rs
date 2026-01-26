@@ -103,6 +103,7 @@ pub fn execute_command(
         .map(|dir| PlannedCommand {
             dir: dir.clone(),
             cmd: cargo_cmd.clone(),
+            env: None,
         })
         .collect();
 
@@ -186,6 +187,7 @@ mod tests {
             PlannedCommand {
                 dir: ".".to_string(),
                 cmd: "cargo test".to_string(),
+                env: None,
             },
         ];
         let plan = ExecutionPlan {
