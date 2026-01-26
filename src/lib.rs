@@ -20,25 +20,15 @@ fn get_project_directories(provided_projects: &[String], cwd: &Path) -> anyhow::
         return Ok(dirs);
     }
 
-    // Fall back to reading the local .meta file
-    let meta_path = cwd.join(".meta");
-
-    if !meta_path.exists() {
-        // No .meta file, just use current directory
-        return Ok(vec![".".to_string()]);
-    }
-
-    let config_str = std::fs::read_to_string(&meta_path)?;
-    let meta_config: serde_json::Value = serde_json::from_str(&config_str)?;
-
+    // Use canonical config parsing (supports JSON + YAML)
+    let tree = match meta_cli::config::walk_meta_tree(cwd, Some(0)) {
+        Ok(t) => t,
+        Err(_) => return Ok(vec![".".to_string()]),
+    };
     let mut dirs = vec![".".to_string()];
-
-    if let Some(projects) = meta_config["projects"].as_object() {
-        for name in projects.keys() {
-            dirs.push(name.clone());
-        }
-    }
-
+    let mut paths: Vec<String> = tree.iter().map(|n| n.info.path.clone()).collect();
+    paths.sort();
+    dirs.extend(paths);
     Ok(dirs)
 }
 
