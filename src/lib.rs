@@ -5,10 +5,11 @@
 pub use meta_plugin_protocol::{
     CommandResult, ExecutionPlan, PlannedCommand, PlanResponse, output_execution_plan,
 };
+use std::path::Path;
 
 /// Get all project directories from .meta config (including root ".")
 /// If provided_projects is not empty, uses that list instead (for --recursive support)
-fn get_project_directories(provided_projects: &[String]) -> anyhow::Result<Vec<String>> {
+fn get_project_directories(provided_projects: &[String], cwd: &Path) -> anyhow::Result<Vec<String>> {
     // If we have provided projects from meta_cli (e.g., when --recursive is used), use them
     if !provided_projects.is_empty() {
         // Include root "." plus all provided project paths
@@ -20,7 +21,6 @@ fn get_project_directories(provided_projects: &[String]) -> anyhow::Result<Vec<S
     }
 
     // Fall back to reading the local .meta file
-    let cwd = std::env::current_dir()?;
     let meta_path = cwd.join(".meta");
 
     if !meta_path.exists() {
@@ -43,8 +43,7 @@ fn get_project_directories(provided_projects: &[String]) -> anyhow::Result<Vec<S
 }
 
 /// Filter directories to only those with Cargo.toml
-fn filter_rust_projects(dirs: &[String]) -> Vec<String> {
-    let cwd = std::env::current_dir().unwrap_or_default();
+fn filter_rust_projects(dirs: &[String], cwd: &Path) -> Vec<String> {
     dirs.iter()
         .filter(|dir| {
             let cargo_path = if *dir == "." {
@@ -67,15 +66,16 @@ pub fn execute_command(
     args: &[String],
     parallel: bool,
     provided_projects: &[String],
+    cwd: &Path,
 ) -> CommandResult {
     // Get all project directories
-    let dirs = match get_project_directories(provided_projects) {
+    let dirs = match get_project_directories(provided_projects, cwd) {
         Ok(d) => d,
         Err(e) => return CommandResult::Error(format!("Failed to get project directories: {e}")),
     };
 
     // Filter to Rust projects only
-    let rust_dirs = filter_rust_projects(&dirs);
+    let rust_dirs = filter_rust_projects(&dirs, cwd);
 
     if rust_dirs.is_empty() {
         return CommandResult::Message("No Rust projects found (no Cargo.toml files)".to_string());
@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn test_unknown_command() {
-        let result = execute_command("cargo unknown", &[], false, &[]);
+        let result = execute_command("cargo unknown", &[], false, &[], Path::new("."));
         match result {
             CommandResult::ShowHelp(Some(msg)) => assert!(msg.contains("unrecognized command")),
             _ => panic!("Expected ShowHelp result"),
@@ -151,16 +151,11 @@ mod tests {
     #[test]
     fn test_no_rust_projects() {
         let temp_dir = TempDir::new().unwrap();
-        let original_dir = std::env::current_dir().unwrap();
 
         // Create .meta with no Rust projects
         std::fs::write(temp_dir.path().join(".meta"), r#"{"projects": {}}"#).unwrap();
 
-        std::env::set_current_dir(temp_dir.path()).unwrap();
-
-        let result = execute_command("cargo build", &[], false, &[]);
-
-        std::env::set_current_dir(original_dir).unwrap();
+        let result = execute_command("cargo build", &[], false, &[], temp_dir.path());
 
         match result {
             CommandResult::Message(msg) => assert!(msg.contains("No Rust projects")),
@@ -171,17 +166,12 @@ mod tests {
     #[test]
     fn test_cargo_build_returns_plan() {
         let temp_dir = TempDir::new().unwrap();
-        let original_dir = std::env::current_dir().unwrap();
 
         // Create a Cargo.toml in root
         std::fs::write(temp_dir.path().join("Cargo.toml"), "[package]\nname = \"test\"\n").unwrap();
         std::fs::write(temp_dir.path().join(".meta"), r#"{"projects": {}}"#).unwrap();
 
-        std::env::set_current_dir(temp_dir.path()).unwrap();
-
-        let result = execute_command("cargo build", &["--release".to_string()], true, &[]);
-
-        std::env::set_current_dir(original_dir).unwrap();
+        let result = execute_command("cargo build", &["--release".to_string()], true, &[], temp_dir.path());
 
         match result {
             CommandResult::Plan(commands, parallel) => {
