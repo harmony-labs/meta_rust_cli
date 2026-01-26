@@ -58,6 +58,11 @@ pub fn execute_command(
     provided_projects: &[String],
     cwd: &Path,
 ) -> CommandResult {
+    // Intercept --help/-h before dispatching to subcommand handlers
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        return CommandResult::ShowHelp(None);
+    }
+
     // Get all project directories
     let dirs = match get_project_directories(provided_projects, cwd) {
         Ok(d) => d,
