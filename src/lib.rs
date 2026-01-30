@@ -191,7 +191,9 @@ mod tests {
             },
         ];
         let plan = ExecutionPlan {
+            pre_commands: vec![],
             commands,
+            post_commands: vec![],
             parallel: Some(true),
         };
         let response = PlanResponse { plan };
