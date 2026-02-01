@@ -3,13 +3,16 @@
 //! Provides Rust/Cargo commands for meta repositories.
 
 pub use meta_plugin_protocol::{
-    CommandResult, ExecutionPlan, PlannedCommand, PlanResponse, output_execution_plan,
+    output_execution_plan, CommandResult, ExecutionPlan, PlanResponse, PlannedCommand,
 };
 use std::path::Path;
 
 /// Get all project directories from .meta config (including root ".")
 /// If provided_projects is not empty, uses that list instead (for --recursive support)
-fn get_project_directories(provided_projects: &[String], cwd: &Path) -> anyhow::Result<Vec<String>> {
+fn get_project_directories(
+    provided_projects: &[String],
+    cwd: &Path,
+) -> anyhow::Result<Vec<String>> {
     // If we have provided projects from meta_cli (e.g., when --recursive is used), use them
     if !provided_projects.is_empty() {
         // Include root "." plus all provided project paths
@@ -94,7 +97,7 @@ pub fn execute_command(
             }
             cmd
         }
-        _ => return CommandResult::ShowHelp(Some(format!("unrecognized command '{}'", command))),
+        _ => return CommandResult::ShowHelp(Some(format!("unrecognized command '{command}'"))),
     };
 
     // Build execution plan
@@ -164,10 +167,20 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
 
         // Create a Cargo.toml in root
-        std::fs::write(temp_dir.path().join("Cargo.toml"), "[package]\nname = \"test\"\n").unwrap();
+        std::fs::write(
+            temp_dir.path().join("Cargo.toml"),
+            "[package]\nname = \"test\"\n",
+        )
+        .unwrap();
         std::fs::write(temp_dir.path().join(".meta"), r#"{"projects": {}}"#).unwrap();
 
-        let result = execute_command("cargo build", &["--release".to_string()], true, &[], temp_dir.path());
+        let result = execute_command(
+            "cargo build",
+            &["--release".to_string()],
+            true,
+            &[],
+            temp_dir.path(),
+        );
 
         match result {
             CommandResult::Plan(commands, parallel) => {
@@ -183,13 +196,11 @@ mod tests {
 
     #[test]
     fn test_execution_plan_serialization() {
-        let commands = vec![
-            PlannedCommand {
-                dir: ".".to_string(),
-                cmd: "cargo test".to_string(),
-                env: None,
-            },
-        ];
+        let commands = vec![PlannedCommand {
+            dir: ".".to_string(),
+            cmd: "cargo test".to_string(),
+            env: None,
+        }];
         let plan = ExecutionPlan {
             pre_commands: vec![],
             commands,

@@ -1,7 +1,7 @@
 //! meta-rust subprocess plugin
 
 use meta_plugin_protocol::{
-    CommandResult, PluginDefinition, PluginHelp, PluginInfo, PluginRequest, run_plugin,
+    run_plugin, CommandResult, PluginDefinition, PluginHelp, PluginInfo, PluginRequest,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -31,12 +31,10 @@ fn main() {
                     "meta cargo test".to_string(),
                     "meta cargo build --release".to_string(),
                 ],
-                note: Some(
-                    "To run raw cargo commands: meta exec -- cargo <command>".to_string(),
-                ),
+                note: Some("To run raw cargo commands: meta exec -- cargo <command>".to_string()),
             }),
         },
-        execute: execute,
+        execute,
     });
 }
 
