@@ -26,6 +26,7 @@ fn main() {
             help: Some(PluginHelp {
                 usage: "meta cargo <command> [args...]".to_string(),
                 commands: help_commands,
+                command_sections: IndexMap::new(),
                 examples: vec![
                     "meta cargo build".to_string(),
                     "meta cargo test".to_string(),
