@@ -207,6 +207,7 @@ mod tests {
             post_commands: vec![],
             parallel: Some(true),
             max_parallel: None,
+            spawn_stagger_ms: None,
         };
         let response = PlanResponse { plan };
         let json = serde_json::to_string(&response).unwrap();
