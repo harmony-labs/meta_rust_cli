@@ -1,13 +1,13 @@
 //! meta-rust subprocess plugin
 
+use indexmap::IndexMap;
 use meta_plugin_protocol::{
     run_plugin, CommandResult, PluginDefinition, PluginHelp, PluginInfo, PluginRequest,
 };
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 fn main() {
-    let mut help_commands = HashMap::new();
+    let mut help_commands = IndexMap::new();
     help_commands.insert(
         "build".to_string(),
         "Build all Rust projects in the workspace".to_string(),
