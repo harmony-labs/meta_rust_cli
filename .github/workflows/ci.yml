@@ -26,10 +26,26 @@ jobs:
       - name: Clone dependencies
         shell: bash
         run: |
-          git clone --depth 1 https://github.com/harmony-labs/meta_plugin_protocol.git
-          git clone --depth 1 https://github.com/harmony-labs/meta_cli.git
-          git clone --depth 1 https://github.com/harmony-labs/meta_core.git
-          git clone --depth 1 https://github.com/harmony-labs/loop_lib.git
+          BRANCH="${{ github.head_ref || github.ref_name }}"
+          for repo in meta_plugin_protocol meta_core; do
+            git clone --depth 1 -b "$BRANCH" "https://github.com/harmony-labs/${repo}.git" 2>/dev/null || \
+            git clone --depth 1 "https://github.com/harmony-labs/${repo}.git"
+          done
+
+      - name: Create workspace Cargo.toml
+        shell: bash
+        run: |
+          cat > Cargo.toml << 'EOF'
+          [workspace]
+          members = ["meta_rust_cli", "meta_plugin_protocol", "meta_core"]
+          resolver = "2"
+
+          [workspace.package]
+          version = "0.1.0"
+          edition = "2021"
+          license = "MIT"
+          repository = "https://github.com/harmony-labs/meta"
+          EOF
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -54,10 +70,25 @@ jobs:
 
       - name: Clone dependencies
         run: |
-          git clone --depth 1 https://github.com/harmony-labs/meta_plugin_protocol.git
-          git clone --depth 1 https://github.com/harmony-labs/meta_cli.git
-          git clone --depth 1 https://github.com/harmony-labs/meta_core.git
-          git clone --depth 1 https://github.com/harmony-labs/loop_lib.git
+          BRANCH="${{ github.head_ref || github.ref_name }}"
+          for repo in meta_plugin_protocol meta_core; do
+            git clone --depth 1 -b "$BRANCH" "https://github.com/harmony-labs/${repo}.git" 2>/dev/null || \
+            git clone --depth 1 "https://github.com/harmony-labs/${repo}.git"
+          done
+
+      - name: Create workspace Cargo.toml
+        run: |
+          cat > Cargo.toml << 'EOF'
+          [workspace]
+          members = ["meta_rust_cli", "meta_plugin_protocol", "meta_core"]
+          resolver = "2"
+
+          [workspace.package]
+          version = "0.1.0"
+          edition = "2021"
+          license = "MIT"
+          repository = "https://github.com/harmony-labs/meta"
+          EOF
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -79,6 +110,30 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          path: meta_rust_cli
+
+      - name: Clone dependencies
+        run: |
+          BRANCH="${{ github.head_ref || github.ref_name }}"
+          for repo in meta_plugin_protocol meta_core; do
+            git clone --depth 1 -b "$BRANCH" "https://github.com/harmony-labs/${repo}.git" 2>/dev/null || \
+            git clone --depth 1 "https://github.com/harmony-labs/${repo}.git"
+          done
+
+      - name: Create workspace Cargo.toml
+        run: |
+          cat > Cargo.toml << 'EOF'
+          [workspace]
+          members = ["meta_rust_cli", "meta_plugin_protocol", "meta_core"]
+          resolver = "2"
+
+          [workspace.package]
+          version = "0.1.0"
+          edition = "2021"
+          license = "MIT"
+          repository = "https://github.com/harmony-labs/meta"
+          EOF
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -86,4 +141,5 @@ jobs:
           components: rustfmt
 
       - name: Check formatting
+        working-directory: meta_rust_cli
         run: cargo fmt --all -- --check
