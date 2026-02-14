@@ -24,7 +24,7 @@ fn get_project_directories(
     }
 
     // Use canonical config parsing (supports JSON + YAML)
-    let tree = match meta_cli::config::walk_meta_tree(cwd, Some(0)) {
+    let tree = match meta_core::config::walk_meta_tree(cwd, Some(0)) {
         Ok(t) => t,
         Err(_) => return Ok(vec![".".to_string()]),
     };

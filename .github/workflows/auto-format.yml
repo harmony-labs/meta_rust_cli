@@ -24,21 +24,53 @@ jobs:
       (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) &&
       github.actor != 'github-actions[bot]'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ github.head_ref || github.ref_name }}
+          path: meta_rust_cli
           # Use PAT to trigger downstream workflows; fallback to GITHUB_TOKEN
           token: ${{ secrets.PARENT_REPO_PAT || github.token }}
+
+      - name: Clone dependencies
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          for repo in meta_plugin_protocol meta_core; do
+            if git clone --depth 1 -b "$BRANCH" "https://github.com/harmony-labs/${repo}.git" 2>/dev/null; then
+              echo "Cloned ${repo}@${BRANCH}"
+            elif git clone --depth 1 "https://github.com/harmony-labs/${repo}.git"; then
+              echo "Branch ${BRANCH} not found for ${repo}; falling back to default branch"
+            else
+              echo "::error::Failed to clone ${repo}"
+              exit 1
+            fi
+          done
+
+      - name: Create workspace Cargo.toml
+        run: |
+          cat > Cargo.toml << 'EOF'
+          [workspace]
+          members = ["meta_rust_cli", "meta_plugin_protocol", "meta_core"]
+          resolver = "2"
+
+          [workspace.package]
+          version = "0.1.0"
+          edition = "2021"
+          license = "MIT"
+          repository = "https://github.com/harmony-labs/meta"
+          EOF
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
 
       - name: Run cargo fmt
+        working-directory: meta_rust_cli
         run: cargo fmt --all
 
       - name: Check for changes
         id: changes
+        working-directory: meta_rust_cli
         run: |
           if git diff --quiet; then
             echo "formatted=false" >> $GITHUB_OUTPUT
@@ -48,6 +80,7 @@ jobs:
 
       - name: Commit and push
         if: steps.changes.outputs.formatted == 'true'
+        working-directory: meta_rust_cli
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
