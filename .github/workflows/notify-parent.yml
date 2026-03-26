@@ -1,0 +1,22 @@
+name: Notify Parent Repo
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify parent repo
+        uses: peter-evans/repository-dispatch@v4
+        with:
+          token: ${{ secrets.PARENT_REPO_PAT }}
+          repository: harmony-labs/meta
+          event-type: child-repo-updated
+          client-payload: >-
+            {
+              "repo_name": ${{ toJSON(github.event.repository.name) }},
+              "short_sha": ${{ toJSON(github.sha) }},
+              "actor": ${{ toJSON(github.actor) }}
+            }
