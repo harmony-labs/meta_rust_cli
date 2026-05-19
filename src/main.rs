@@ -21,15 +21,22 @@ fn main() {
         info: PluginInfo {
             name: "rust".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            commands: vec!["cargo build".to_string(), "cargo test".to_string()],
+            commands: vec![
+                "cargo build".to_string(),
+                "cargo test".to_string(),
+                "rust build".to_string(),
+                "rust test".to_string(),
+            ],
             description: Some("Rust/Cargo commands for meta repositories".to_string()),
             help: Some(PluginHelp {
-                usage: "meta cargo <command> [args...]".to_string(),
+                usage: "meta cargo <command> [args...]\n       meta rust <command> [args...]"
+                    .to_string(),
                 commands: help_commands,
                 command_sections: IndexMap::new(),
                 examples: vec![
                     "meta cargo build".to_string(),
                     "meta cargo test".to_string(),
+                    "meta rust build".to_string(),
                     "meta cargo build --release".to_string(),
                 ],
                 note: Some("To run raw cargo commands: meta exec -- cargo <command>".to_string()),
