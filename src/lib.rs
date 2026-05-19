@@ -62,7 +62,11 @@ pub fn execute_command(
     cwd: &Path,
 ) -> CommandResult {
     // Intercept --help/-h before dispatching to subcommand handlers
-    if args.iter().any(|a| a == "--help" || a == "-h") {
+    if command
+        .split_whitespace()
+        .chain(args.iter().map(String::as_str))
+        .any(|a| a == "--help" || a == "-h")
+    {
         return CommandResult::ShowHelp(None);
     }
 
@@ -81,7 +85,7 @@ pub fn execute_command(
 
     // Build the cargo command
     let cargo_cmd = match command {
-        "cargo build" => {
+        "cargo build" | "rust build" => {
             let mut cmd = "cargo build".to_string();
             for arg in args {
                 cmd.push(' ');
@@ -89,7 +93,7 @@ pub fn execute_command(
             }
             cmd
         }
-        "cargo test" => {
+        "cargo test" | "rust test" => {
             let mut cmd = "cargo test".to_string();
             for arg in args {
                 cmd.push(' ');
