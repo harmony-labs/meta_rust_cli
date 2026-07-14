@@ -103,6 +103,44 @@ fn filter_rust_projects(dirs: &[String]) -> Vec<String> {
         .collect()
 }
 
+#[cfg(any(windows, test))]
+fn windows_filter_match_key(value: &str) -> String {
+    let normalized = value.replace('\\', "/");
+    let normalized = if let Some(rest) = normalized.strip_prefix("//?/UNC/") {
+        format!("//{rest}")
+    } else if let Some(rest) = normalized.strip_prefix("//?/") {
+        rest.to_string()
+    } else {
+        normalized
+    };
+
+    normalized.to_ascii_lowercase()
+}
+
+fn filter_matches_path(path: &str, filter: &str) -> bool {
+    let filter = filter.trim_end_matches('/');
+
+    #[cfg(windows)]
+    {
+        // canonicalize() returns verbatim paths on Windows and may also expand
+        // short names or traverse junctions. Canonicalize an absolute filter
+        // too when possible so it has the same spelling as project paths.
+        let canonical_filter = Path::new(filter)
+            .is_absolute()
+            .then(|| std::fs::canonicalize(filter).ok())
+            .flatten()
+            .map(|path| path.to_string_lossy().into_owned());
+        let filter = canonical_filter.as_deref().unwrap_or(filter);
+
+        windows_filter_match_key(path).contains(&windows_filter_match_key(filter))
+    }
+
+    #[cfg(not(windows))]
+    {
+        path.contains(filter)
+    }
+}
+
 /// Apply the host's directory selection before deciding whether the scope has
 /// any Rust projects. loop_lib applies the same filters during execution, but
 /// planning must see the selected scope to produce a clear empty result.
@@ -114,15 +152,18 @@ fn filter_selected_projects(
     let mut selected = dirs.to_vec();
 
     if let Some(includes) = include_filters.filter(|filters| !filters.is_empty()) {
-        selected.retain(|path| includes.iter().any(|filter| path.contains(filter)));
+        selected.retain(|path| {
+            includes
+                .iter()
+                .any(|filter| filter_matches_path(path, filter))
+        });
     }
 
     if let Some(excludes) = exclude_filters.filter(|filters| !filters.is_empty()) {
         selected.retain(|path| {
             !excludes
                 .iter()
-                .map(|filter| filter.trim_end_matches('/'))
-                .any(|filter| path.contains(filter))
+                .any(|filter| filter_matches_path(path, filter))
         });
     }
 
@@ -572,6 +613,18 @@ mod tests {
             exclude_all,
             CommandResult::Message(message) if message.contains("No Rust projects found")
         ));
+    }
+
+    #[test]
+    fn test_windows_filter_match_key_equates_verbatim_and_ordinary_paths() {
+        assert_eq!(
+            windows_filter_match_key(r"\\?\C:\Users\Runner\crate"),
+            windows_filter_match_key(r"c:\users\runner\crate")
+        );
+        assert_eq!(
+            windows_filter_match_key(r"\\?\UNC\server\share\crate"),
+            windows_filter_match_key(r"\\server\share\crate")
+        );
     }
 
     #[cfg(not(windows))]
