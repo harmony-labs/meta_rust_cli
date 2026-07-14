@@ -71,6 +71,10 @@ fn planned_command_survives_the_real_cmd_boundary_without_injection() {
         "prefix%PATH%suffix".to_string(),
         "%hello".to_string(),
         "%%cd:~,%".to_string(),
+        "%META_RUST_PCT%".to_string(),
+        "%CD%".to_string(),
+        "%0".to_string(),
+        "%%%%".to_string(),
         "%PATH%PATH%".to_string(),
         "amp&ersand".to_string(),
         "pipe|value".to_string(),
@@ -87,8 +91,8 @@ fn planned_command_survives_the_real_cmd_boundary_without_injection() {
     ];
     let projects = vec![temp.path().to_string_lossy().into_owned()];
 
-    let command = match execute_command("cargo", &args, false, &projects, temp.path()) {
-        CommandResult::Plan(commands, _) => commands.into_iter().next().unwrap().cmd,
+    let planned = match execute_command("cargo", &args, false, &projects, temp.path()) {
+        CommandResult::Plan(commands, _) => commands.into_iter().next().unwrap(),
         _ => panic!("expected a Cargo execution plan"),
     };
 
@@ -97,19 +101,24 @@ fn planned_command_survives_the_real_cmd_boundary_without_injection() {
         &std::env::var_os("PATH").unwrap_or_default(),
     ));
     let path: OsString = std::env::join_paths(path_entries).unwrap();
-    let output = Command::new("cmd.exe")
+    let mut process = Command::new("cmd.exe");
+    process
         .arg("/c")
-        .arg(&command)
+        .arg(&planned.cmd)
         .current_dir(temp.path())
         .env("PATH", path)
-        .output()
-        .unwrap();
+        .env("META_RUST_PCT", &injection);
+    if let Some(environment) = &planned.env {
+        process.envs(environment);
+    }
+    let output = process.output().unwrap();
 
     assert!(
         output.status.success(),
-        "cmd failed:\nstdout: {}\nstderr: {}\ncommand: {command}",
+        "cmd failed:\nstdout: {}\nstderr: {}\ncommand: {}",
         String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&output.stderr),
+        planned.cmd
     );
     assert!(!marker.exists(), "hostile argument escaped into cmd syntax");
 

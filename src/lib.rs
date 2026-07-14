@@ -182,6 +182,8 @@ const WINDOWS_NEWLINE_ERROR: &str =
 #[cfg(any(windows, test))]
 const WINDOWS_NUL_ERROR: &str =
     "Cargo arguments containing NUL bytes cannot be transported through cmd.exe";
+#[cfg(any(windows, test))]
+const WINDOWS_LITERAL_PERCENT_ENV: &str = "META_RUST_PCT";
 
 #[cfg(any(windows, test))]
 fn quote_windows_cmd_token(token: &str) -> Result<String, &'static str> {
@@ -190,10 +192,10 @@ fn quote_windows_cmd_token(token: &str) -> Result<String, &'static str> {
     // serializers, so embedded quotes must instead be doubled. Quote a broad
     // denylist of ASCII syntax to keep cmd metacharacters inside the argument.
     //
-    // cmd has no direct escape for a literal `%` on a `/C` command line. The
-    // zero-length `%cd:~,%` expansion prevents the two user-supplied percent
-    // signs in `%NAME%` from ever forming an environment-variable reference.
-    // Command extensions are enabled by default for a fresh cmd.exe process.
+    // cmd has no direct escape for a literal `%` on a `/C` command line. Use a
+    // controlled environment-variable expansion whose value is one percent.
+    // Expansion is a single pass, so a reconstructed `%NAME%` remains literal
+    // instead of being reinterpreted as another environment-variable reference.
     if token.contains('\0') {
         return Err(WINDOWS_NUL_ERROR);
     }
@@ -229,7 +231,11 @@ fn quote_windows_cmd_token(token: &str) -> Result<String, &'static str> {
             escaped.extend(std::iter::repeat_n('\\', backslashes));
             escaped.push('"');
         } else if ch == '%' {
-            escaped.push_str("%%cd:~,%");
+            escaped.push('%');
+            escaped.push_str(WINDOWS_LITERAL_PERCENT_ENV);
+            escaped.push('%');
+            backslashes = 0;
+            continue;
         }
         backslashes = 0;
         escaped.push(ch);
@@ -242,6 +248,33 @@ fn quote_windows_cmd_token(token: &str) -> Result<String, &'static str> {
         escaped.push('"');
     }
     Ok(escaped)
+}
+
+#[cfg(any(windows, test))]
+fn windows_shell_transport_environment(
+    tokens: &[String],
+) -> Option<std::collections::HashMap<String, String>> {
+    tokens.iter().any(|token| token.contains('%')).then(|| {
+        std::collections::HashMap::from([(
+            WINDOWS_LITERAL_PERCENT_ENV.to_string(),
+            "%".to_string(),
+        )])
+    })
+}
+
+fn shell_transport_environment(
+    tokens: &[String],
+) -> Option<std::collections::HashMap<String, String>> {
+    #[cfg(windows)]
+    {
+        windows_shell_transport_environment(tokens)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = tokens;
+        None
+    }
 }
 
 fn quote_shell_token(token: &str) -> Result<String, &'static str> {
@@ -332,6 +365,7 @@ pub fn execute_command_with_filters(
         Ok(command) => command,
         Err(error) => return CommandResult::Error(error.to_string()),
     };
+    let cargo_env = shell_transport_environment(&cargo_tokens);
 
     // Build execution plan
     let commands: Vec<PlannedCommand> = rust_dirs
@@ -339,7 +373,7 @@ pub fn execute_command_with_filters(
         .map(|dir| PlannedCommand {
             dir: dir.clone(),
             cmd: cargo_cmd.clone(),
-            env: None,
+            env: cargo_env.clone(),
         })
         .collect();
 
@@ -680,10 +714,20 @@ mod tests {
             "\"quoted\"\"&echo injected\""
         );
 
-        // Literal percent pairs must not become environment-variable syntax.
+        // Literal percent pairs are reconstructed from one controlled
+        // expansion and cannot become arbitrary environment-variable syntax.
         let percent = quote_windows_cmd_token("%PATH%").unwrap();
-        assert_eq!(percent, "\"%%cd:~,%%PATH%%cd:~,%%\"");
+        assert_eq!(percent, "\"%META_RUST_PCT%PATH%META_RUST_PCT%\"");
         assert_ne!(percent, "\"%PATH%\"");
+
+        let tokens = vec!["cargo".to_string(), "%PATH%".to_string()];
+        let environment = windows_shell_transport_environment(&tokens).unwrap();
+        assert_eq!(
+            environment
+                .get(WINDOWS_LITERAL_PERCENT_ENV)
+                .map(String::as_str),
+            Some("%")
+        );
     }
 
     #[test]
@@ -716,6 +760,7 @@ mod tests {
         );
         #[cfg(windows)]
         assert_eq!(commands[0].cmd, "cargo test -- --recursive --help");
+        assert!(commands[0].env.is_none());
     }
 
     #[test]
