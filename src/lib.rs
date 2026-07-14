@@ -4,7 +4,8 @@
 
 use indexmap::IndexMap;
 pub use meta_plugin_protocol::{
-    output_execution_plan, CommandResult, ExecutionPlan, PlanResponse, PlannedCommand, PluginHelp,
+    output_execution_plan, CommandResult, ExecutionPlan, PlanExecutionPolicy, PlanResponse,
+    PlannedCommand, PluginHelp, HOST_CAPABILITY_PLAN_EXECUTION_POLICY_V1,
 };
 #[cfg(not(windows))]
 use std::borrow::Cow;
@@ -351,6 +352,8 @@ fn serialize_shell_command(tokens: &[String]) -> Result<String, &'static str> {
 ///
 /// If `provided_projects` is not empty, it will be used instead of reading from .meta file.
 /// This allows meta_cli to pass in the full project list when --recursive is used.
+/// Operational commands fail closed because this legacy entry point cannot
+/// negotiate the host's plan execution policy; plugin help remains available.
 pub fn execute_command(
     command: &str,
     args: &[String],
@@ -358,10 +361,41 @@ pub fn execute_command(
     provided_projects: &[String],
     cwd: &Path,
 ) -> CommandResult {
-    execute_command_with_filters(command, args, parallel, provided_projects, cwd, None, None)
+    execute_command_with_filters(
+        command,
+        args,
+        parallel,
+        provided_projects,
+        cwd,
+        None,
+        None,
+        &[],
+    )
 }
 
-/// Execute a Rust/Cargo command with the host's selected directory filters.
+/// Execute a Rust/Cargo command after negotiating host execution behavior.
+pub fn execute_command_with_host_capabilities(
+    command: &str,
+    args: &[String],
+    parallel: bool,
+    provided_projects: &[String],
+    cwd: &Path,
+    host_capabilities: &[String],
+) -> CommandResult {
+    execute_command_with_filters(
+        command,
+        args,
+        parallel,
+        provided_projects,
+        cwd,
+        None,
+        None,
+        host_capabilities,
+    )
+}
+
+/// Execute a Rust/Cargo command with the host's negotiated behavior and filters.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_command_with_filters(
     command: &str,
     args: &[String],
@@ -370,6 +404,7 @@ pub fn execute_command_with_filters(
     cwd: &Path,
     include_filters: Option<&[String]>,
     exclude_filters: Option<&[String]>,
+    host_capabilities: &[String],
 ) -> CommandResult {
     let mut command_parts = command.split_whitespace();
     let namespace = command_parts.next().unwrap_or_default();
@@ -388,6 +423,15 @@ pub fn execute_command_with_filters(
     // payload after `--` is opaque and must never be interpreted here.
     if cargo_args.is_empty() || help_requested(&cargo_args) {
         return CommandResult::ShowHelp(None);
+    }
+
+    if !host_capabilities
+        .iter()
+        .any(|capability| capability == HOST_CAPABILITY_PLAN_EXECUTION_POLICY_V1)
+    {
+        return CommandResult::Error(format!(
+            "Cargo operations require host capability '{HOST_CAPABILITY_PLAN_EXECUTION_POLICY_V1}'"
+        ));
     }
 
     // Get all project directories
@@ -427,7 +471,14 @@ pub fn execute_command_with_filters(
         })
         .collect();
 
-    CommandResult::Plan(commands, Some(parallel))
+    CommandResult::PlanWithPolicy(
+        commands,
+        Some(parallel),
+        PlanExecutionPolicy {
+            expand_loop_aliases: false,
+            apply_host_filters: false,
+        },
+    )
 }
 
 /// Build the structured runtime help advertised by the plugin.
@@ -454,7 +505,7 @@ pub fn plugin_help() -> PluginHelp {
             "meta cargo nextest run".to_string(),
         ],
         note: Some(
-            "Meta selects and loops over directories containing Cargo.toml; Cargo validates the command and its arguments. Put Meta controls before cargo/rust. Use `cargo help <command>` for command-specific Cargo options."
+            "The Rust plugin selects, filters, and deduplicates directories containing Cargo.toml; Cargo validates the command and its arguments. Put Meta controls before cargo/rust. Use `cargo help <command>` for command-specific Cargo options."
                 .to_string(),
         ),
     }
@@ -478,9 +529,61 @@ mod tests {
         values.iter().map(|value| (*value).to_string()).collect()
     }
 
+    fn plan_execution_policy_capability() -> Vec<String> {
+        vec![HOST_CAPABILITY_PLAN_EXECUTION_POLICY_V1.to_string()]
+    }
+
+    fn execute_capable_command(
+        command: &str,
+        args: &[String],
+        parallel: bool,
+        provided_projects: &[String],
+        cwd: &Path,
+    ) -> CommandResult {
+        execute_command_with_host_capabilities(
+            command,
+            args,
+            parallel,
+            provided_projects,
+            cwd,
+            &plan_execution_policy_capability(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_capable_command_with_filters(
+        command: &str,
+        args: &[String],
+        parallel: bool,
+        provided_projects: &[String],
+        cwd: &Path,
+        include_filters: Option<&[String]>,
+        exclude_filters: Option<&[String]>,
+    ) -> CommandResult {
+        execute_command_with_filters(
+            command,
+            args,
+            parallel,
+            provided_projects,
+            cwd,
+            include_filters,
+            exclude_filters,
+            &plan_execution_policy_capability(),
+        )
+    }
+
     fn expect_plan(result: CommandResult) -> (Vec<PlannedCommand>, Option<bool>) {
         match result {
-            CommandResult::Plan(commands, parallel) => (commands, parallel),
+            CommandResult::PlanWithPolicy(commands, parallel, execution_policy) => {
+                assert_eq!(
+                    execution_policy,
+                    PlanExecutionPolicy {
+                        expand_loop_aliases: false,
+                        apply_host_filters: false,
+                    }
+                );
+                (commands, parallel)
+            }
             _ => panic!("Expected Plan result"),
         }
     }
@@ -495,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn test_plugin_help_describes_general_pass_through() {
+    fn test_plugin_help_describes_arbitrary_commands() {
         let help = plugin_help();
         assert!(help.usage.contains("cargo <command>"));
         assert!(help.usage.contains("rust <command>"));
@@ -524,13 +627,35 @@ mod tests {
     }
 
     #[test]
+    fn test_operational_commands_require_plan_execution_policy_capability() {
+        let temp_dir = TempDir::new().unwrap();
+        create_rust_project(temp_dir.path());
+        let projects = vec![temp_dir.path().to_string_lossy().into_owned()];
+
+        let result = execute_command(
+            "cargo",
+            &strings(&["check"]),
+            false,
+            &projects,
+            temp_dir.path(),
+        );
+
+        assert!(matches!(
+            result,
+            CommandResult::Error(message)
+                if message.contains(HOST_CAPABILITY_PLAN_EXECUTION_POLICY_V1)
+        ));
+    }
+
+    #[test]
     fn test_no_rust_projects() {
         let temp_dir = TempDir::new().unwrap();
 
         // Create .meta with no Rust projects
         std::fs::write(temp_dir.path().join(".meta"), r#"{"projects": {}}"#).unwrap();
 
-        let result = execute_command("cargo", &strings(&["build"]), false, &[], temp_dir.path());
+        let result =
+            execute_capable_command("cargo", &strings(&["build"]), false, &[], temp_dir.path());
 
         match result {
             CommandResult::Message(msg) => assert!(msg.contains("No Rust projects")),
@@ -539,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cargo_commands_pass_through_without_a_catalog() {
+    fn test_arbitrary_cargo_commands_need_no_catalog() {
         let temp_dir = TempDir::new().unwrap();
         create_rust_project(temp_dir.path());
         let projects = vec![temp_dir.path().to_string_lossy().into_owned()];
@@ -552,7 +677,7 @@ mod tests {
             strings(&["cargo", "nextest", "run"]),
             strings(&["cargo", "definitely-not-a-built-in"]),
         ] {
-            let (commands, parallel) = expect_plan(execute_command(
+            let (commands, parallel) = expect_plan(execute_capable_command(
                 "cargo",
                 &expected[1..],
                 true,
@@ -575,14 +700,14 @@ mod tests {
         let projects = vec![temp_dir.path().to_string_lossy().into_owned()];
         let args = strings(&["check", "--all-targets"]);
 
-        let cargo = expect_plan(execute_command(
+        let cargo = expect_plan(execute_capable_command(
             "cargo",
             &args,
             false,
             &projects,
             temp_dir.path(),
         ));
-        let rust = expect_plan(execute_command(
+        let rust = expect_plan(execute_capable_command(
             "rust",
             &args,
             false,
@@ -612,7 +737,7 @@ mod tests {
             root.join("other/../child").to_string_lossy().into_owned(),
             non_rust.to_string_lossy().into_owned(),
         ];
-        let (commands, _) = expect_plan(execute_command(
+        let (commands, _) = expect_plan(execute_capable_command(
             "cargo",
             &strings(&["clean"]),
             false,
@@ -677,7 +802,7 @@ mod tests {
         ];
         let alias_filter = vec![alias.to_string_lossy().into_owned()];
 
-        let (commands, _) = expect_plan(execute_command_with_filters(
+        let (commands, _) = expect_plan(execute_capable_command_with_filters(
             "cargo",
             &strings(&["check"]),
             false,
@@ -692,7 +817,7 @@ mod tests {
             std::fs::canonicalize(&project).unwrap()
         );
 
-        let excluded = execute_command_with_filters(
+        let excluded = execute_capable_command_with_filters(
             "cargo",
             &strings(&["check"]),
             false,
@@ -720,7 +845,7 @@ mod tests {
         ];
 
         let include_filters = strings(&["docs"]);
-        let include_docs = execute_command_with_filters(
+        let include_docs = execute_capable_command_with_filters(
             "cargo",
             &strings(&["check"]),
             false,
@@ -735,7 +860,7 @@ mod tests {
         ));
 
         let exclude_filters = vec![root.to_string_lossy().into_owned()];
-        let exclude_all = execute_command_with_filters(
+        let exclude_all = execute_capable_command_with_filters(
             "cargo",
             &strings(&["check"]),
             false,
@@ -784,7 +909,7 @@ mod tests {
         ];
         let child_filter = strings(&["child\\"]);
 
-        let (included, _) = expect_plan(execute_command_with_filters(
+        let (included, _) = expect_plan(execute_capable_command_with_filters(
             "cargo",
             &strings(&["check"]),
             false,
@@ -799,7 +924,7 @@ mod tests {
             std::fs::canonicalize(&child).unwrap()
         );
 
-        let (excluded, _) = expect_plan(execute_command_with_filters(
+        let (excluded, _) = expect_plan(execute_capable_command_with_filters(
             "cargo",
             &strings(&["check"]),
             false,
@@ -832,7 +957,7 @@ mod tests {
             "",
         ]);
 
-        let (commands, _) = expect_plan(execute_command(
+        let (commands, _) = expect_plan(execute_capable_command(
             "cargo",
             &args,
             false,
@@ -915,7 +1040,7 @@ mod tests {
         let projects = vec![temp_dir.path().to_string_lossy().into_owned()];
         let args = strings(&["test", "--", "--recursive", "--help"]);
 
-        let (commands, _) = expect_plan(execute_command(
+        let (commands, _) = expect_plan(execute_capable_command(
             "cargo",
             &args,
             false,
@@ -939,7 +1064,7 @@ mod tests {
         create_rust_project(temp_dir.path());
         let projects = vec![temp_dir.path().to_string_lossy().into_owned()];
 
-        let (commands, _) = expect_plan(execute_command(
+        let (commands, _) = expect_plan(execute_capable_command(
             "rust build",
             &strings(&["--release"]),
             false,
@@ -965,10 +1090,18 @@ mod tests {
             max_parallel: None,
             spawn_stagger_ms: None,
         };
-        let response = PlanResponse { plan };
+        let response = PlanResponse {
+            plan,
+            execution_policy: PlanExecutionPolicy {
+                expand_loop_aliases: false,
+                apply_host_filters: false,
+            },
+        };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"plan\""));
         assert!(json.contains("\"commands\""));
         assert!(json.contains("cargo test"));
+        assert!(json.contains("\"expand_loop_aliases\":false"));
+        assert!(json.contains("\"apply_host_filters\":false"));
     }
 }

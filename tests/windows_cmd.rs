@@ -1,6 +1,8 @@
 #![cfg(windows)]
 
-use meta_rust_cli::{execute_command, CommandResult};
+use meta_rust_cli::{
+    execute_command_with_host_capabilities, CommandResult, HOST_CAPABILITY_PLAN_EXECUTION_POLICY_V1,
+};
 use std::ffi::OsString;
 use std::process::Command;
 use tempfile::TempDir;
@@ -93,8 +95,20 @@ fn planned_command_survives_the_real_cmd_boundary_without_injection() {
     ];
     let projects = vec![temp.path().to_string_lossy().into_owned()];
 
-    let planned = match execute_command("cargo", &args, false, &projects, temp.path()) {
-        CommandResult::Plan(commands, _) => commands.into_iter().next().unwrap(),
+    let capabilities = vec![HOST_CAPABILITY_PLAN_EXECUTION_POLICY_V1.to_string()];
+    let planned = match execute_command_with_host_capabilities(
+        "cargo",
+        &args,
+        false,
+        &projects,
+        temp.path(),
+        &capabilities,
+    ) {
+        CommandResult::PlanWithPolicy(commands, _, execution_policy) => {
+            assert!(!execution_policy.expand_loop_aliases);
+            assert!(!execution_policy.apply_host_filters);
+            commands.into_iter().next().unwrap()
+        }
         _ => panic!("expected a Cargo execution plan"),
     };
     assert!(
@@ -148,12 +162,14 @@ fn planned_command_rejects_cmd_line_breaks() {
     .unwrap();
     let projects = vec![temp.path().to_string_lossy().into_owned()];
 
-    let result = execute_command(
+    let capabilities = vec![HOST_CAPABILITY_PLAN_EXECUTION_POLICY_V1.to_string()];
+    let result = execute_command_with_host_capabilities(
         "cargo",
         &["check".to_string(), "line\nbreak".to_string()],
         false,
         &projects,
         temp.path(),
+        &capabilities,
     );
     assert!(matches!(result, CommandResult::Error(message) if message.contains("cmd.exe")));
 }

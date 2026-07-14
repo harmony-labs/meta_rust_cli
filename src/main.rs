@@ -11,7 +11,7 @@ fn main() {
             name: "rust".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             commands: vec!["cargo".to_string(), "rust".to_string()],
-            description: Some("Cargo command pass-through for Meta workspaces".to_string()),
+            description: Some("Cargo commands for Meta workspaces".to_string()),
             help: Some(meta_rust_cli::plugin_help()),
         },
         execute,
@@ -36,5 +36,6 @@ fn execute(request: PluginRequest) -> CommandResult {
         &cwd,
         request.options.include_filters.as_deref(),
         request.options.exclude_filters.as_deref(),
+        &request.host_capabilities,
     )
 }
