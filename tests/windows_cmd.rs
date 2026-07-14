@@ -109,7 +109,7 @@ fn planned_command_survives_the_real_cmd_boundary_without_injection() {
     let path: OsString = std::env::join_paths(path_entries).unwrap();
     let mut process = Command::new("cmd.exe");
     process
-        .arg("/c")
+        .args(["/d", "/v:off", "/c"])
         .arg(&planned.cmd)
         .current_dir(temp.path())
         .env("PATH", path)

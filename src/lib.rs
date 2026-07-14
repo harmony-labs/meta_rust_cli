@@ -8,7 +8,6 @@ pub use meta_plugin_protocol::{
 };
 #[cfg(not(windows))]
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 /// Normalize project paths without requiring them to exist.
@@ -30,8 +29,14 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
-/// Normalize and deduplicate paths while preserving their first-seen order.
-fn normalize_project_directories(paths: &[String], cwd: &Path) -> Vec<String> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectDirectory {
+    execution_path: String,
+    filter_paths: Vec<String>,
+}
+
+/// Preserve original path spellings while deduplicating canonical execution paths.
+fn normalize_project_directories(paths: &[String], cwd: &Path) -> Vec<ProjectDirectory> {
     let base = if cwd.is_absolute() {
         cwd.to_path_buf()
     } else {
@@ -39,30 +44,36 @@ fn normalize_project_directories(paths: &[String], cwd: &Path) -> Vec<String> {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(cwd)
     };
-    let mut seen = HashSet::new();
+    let mut normalized = IndexMap::<PathBuf, Vec<String>>::new();
 
-    paths
-        .iter()
-        .filter_map(|path| {
-            let path = Path::new(path);
-            let absolute = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                base.join(path)
-            };
-            // Resolve the original path before lexically collapsing `..`.
-            // Filesystem traversal through `symlink/..` is not necessarily
-            // equivalent to removing both components textually.
-            let normalized = std::fs::canonicalize(&absolute).unwrap_or_else(|_| {
-                let lexical = normalize_path(&absolute);
-                std::fs::canonicalize(&lexical).unwrap_or(lexical)
-            });
+    for path in paths {
+        let path = Path::new(path);
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            base.join(path)
+        };
+        let filter_path = absolute.to_string_lossy().into_owned();
 
-            if seen.insert(normalized.clone()) {
-                Some(normalized.to_string_lossy().into_owned())
-            } else {
-                None
-            }
+        // Resolve the original path before lexically collapsing `..`.
+        // Filesystem traversal through `symlink/..` is not necessarily
+        // equivalent to removing both components textually.
+        let execution_path = std::fs::canonicalize(&absolute).unwrap_or_else(|_| {
+            let lexical = normalize_path(&absolute);
+            std::fs::canonicalize(&lexical).unwrap_or(lexical)
+        });
+
+        let filter_paths = normalized.entry(execution_path).or_default();
+        if !filter_paths.contains(&filter_path) {
+            filter_paths.push(filter_path);
+        }
+    }
+
+    normalized
+        .into_iter()
+        .map(|(execution_path, filter_paths)| ProjectDirectory {
+            execution_path: execution_path.to_string_lossy().into_owned(),
+            filter_paths,
         })
         .collect()
 }
@@ -73,7 +84,7 @@ fn normalize_project_directories(paths: &[String], cwd: &Path) -> Vec<String> {
 fn get_project_directories(
     provided_projects: &[String],
     cwd: &Path,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<Vec<ProjectDirectory>> {
     // A host-supplied project list already includes the Meta root and reflects
     // recursion, worktree selection, and tag filtering. Treat it as authoritative;
     // include/exclude filters are applied below before Rust-project detection.
@@ -96,10 +107,10 @@ fn get_project_directories(
 }
 
 /// Filter directories to only those with Cargo.toml
-fn filter_rust_projects(dirs: &[String]) -> Vec<String> {
+fn filter_rust_projects(dirs: &[ProjectDirectory]) -> Vec<String> {
     dirs.iter()
-        .filter(|dir| Path::new(dir).join("Cargo.toml").is_file())
-        .cloned()
+        .filter(|dir| Path::new(&dir.execution_path).join("Cargo.toml").is_file())
+        .map(|dir| dir.execution_path.clone())
         .collect()
 }
 
@@ -114,12 +125,15 @@ fn windows_filter_match_key(value: &str) -> String {
         normalized
     };
 
-    normalized.to_ascii_lowercase()
+    normalized.trim_end_matches('/').to_ascii_lowercase()
+}
+
+#[cfg(any(windows, test))]
+fn windows_filter_matches_path(path: &str, filter: &str) -> bool {
+    windows_filter_match_key(path).contains(&windows_filter_match_key(filter))
 }
 
 fn filter_matches_path(path: &str, filter: &str) -> bool {
-    let filter = filter.trim_end_matches('/');
-
     #[cfg(windows)]
     {
         // canonicalize() returns verbatim paths on Windows and may also expand
@@ -132,30 +146,38 @@ fn filter_matches_path(path: &str, filter: &str) -> bool {
             .map(|path| path.to_string_lossy().into_owned());
         let filter = canonical_filter.as_deref().unwrap_or(filter);
 
-        windows_filter_match_key(path).contains(&windows_filter_match_key(filter))
+        windows_filter_matches_path(path, filter)
     }
 
     #[cfg(not(windows))]
     {
-        path.contains(filter)
+        path.contains(filter.trim_end_matches('/'))
     }
+}
+
+fn project_matches_filter(project: &ProjectDirectory, filter: &str) -> bool {
+    project
+        .filter_paths
+        .iter()
+        .any(|path| filter_matches_path(path, filter))
+        || filter_matches_path(&project.execution_path, filter)
 }
 
 /// Apply the host's directory selection before deciding whether the scope has
 /// any Rust projects. loop_lib applies the same filters during execution, but
 /// planning must see the selected scope to produce a clear empty result.
 fn filter_selected_projects(
-    dirs: &[String],
+    dirs: &[ProjectDirectory],
     include_filters: Option<&[String]>,
     exclude_filters: Option<&[String]>,
-) -> Vec<String> {
+) -> Vec<ProjectDirectory> {
     let mut selected = dirs.to_vec();
 
     if let Some(includes) = include_filters.filter(|filters| !filters.is_empty()) {
         selected.retain(|path| {
             includes
                 .iter()
-                .any(|filter| filter_matches_path(path, filter))
+                .any(|filter| project_matches_filter(path, filter))
         });
     }
 
@@ -163,7 +185,7 @@ fn filter_selected_projects(
         selected.retain(|path| {
             !excludes
                 .iter()
-                .any(|filter| filter_matches_path(path, filter))
+                .any(|filter| project_matches_filter(path, filter))
         });
     }
 
@@ -625,13 +647,64 @@ mod tests {
         symlink(&anchor, root.join("link")).unwrap();
 
         let apparent = root.join("link/../crate").to_string_lossy().into_owned();
-        let normalized = normalize_project_directories(&[apparent], &root);
+        let normalized = normalize_project_directories(std::slice::from_ref(&apparent), &root);
 
         assert_eq!(normalized.len(), 1);
         assert_eq!(
-            PathBuf::from(&normalized[0]),
+            PathBuf::from(&normalized[0].execution_path),
             std::fs::canonicalize(rust_project).unwrap()
         );
+        assert_eq!(normalized[0].filter_paths, vec![apparent]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlink_alias_filters_survive_canonical_deduplication() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let project = root.join("project");
+        let alias = root.join("project-alias");
+        create_rust_project(&project);
+        symlink(&project, &alias).unwrap();
+
+        // Put the canonical spelling first so the alias would be lost by
+        // first-seen canonical deduplication unless match spellings are grouped.
+        let projects = vec![
+            project.to_string_lossy().into_owned(),
+            alias.to_string_lossy().into_owned(),
+        ];
+        let alias_filter = vec![alias.to_string_lossy().into_owned()];
+
+        let (commands, _) = expect_plan(execute_command_with_filters(
+            "cargo",
+            &strings(&["check"]),
+            false,
+            &projects,
+            root,
+            Some(&alias_filter),
+            None,
+        ));
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            PathBuf::from(&commands[0].dir),
+            std::fs::canonicalize(&project).unwrap()
+        );
+
+        let excluded = execute_command_with_filters(
+            "cargo",
+            &strings(&["check"]),
+            false,
+            &projects,
+            root,
+            None,
+            Some(&alias_filter),
+        );
+        assert!(matches!(
+            excluded,
+            CommandResult::Message(message) if message.contains("No Rust projects found")
+        ));
     }
 
     #[test]
@@ -686,6 +759,59 @@ mod tests {
         assert_eq!(
             windows_filter_match_key(r"\\?\UNC\server\share\crate"),
             windows_filter_match_key(r"\\server\share\crate")
+        );
+        assert_eq!(
+            windows_filter_match_key(r"C:\Users\Runner\crate\"),
+            windows_filter_match_key(r"C:\Users\Runner\crate")
+        );
+        assert!(windows_filter_matches_path(
+            r"C:\Users\Runner\crate",
+            r"runner\crate\"
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_trailing_backslash_filters_select_projects() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let child = root.join("child");
+        create_rust_project(root);
+        create_rust_project(&child);
+        let projects = vec![
+            root.to_string_lossy().into_owned(),
+            child.to_string_lossy().into_owned(),
+        ];
+        let child_filter = strings(&["child\\"]);
+
+        let (included, _) = expect_plan(execute_command_with_filters(
+            "cargo",
+            &strings(&["check"]),
+            false,
+            &projects,
+            root,
+            Some(&child_filter),
+            None,
+        ));
+        assert_eq!(included.len(), 1);
+        assert_eq!(
+            PathBuf::from(&included[0].dir),
+            std::fs::canonicalize(&child).unwrap()
+        );
+
+        let (excluded, _) = expect_plan(execute_command_with_filters(
+            "cargo",
+            &strings(&["check"]),
+            false,
+            &projects,
+            root,
+            None,
+            Some(&child_filter),
+        ));
+        assert_eq!(excluded.len(), 1);
+        assert_eq!(
+            PathBuf::from(&excluded[0].dir),
+            std::fs::canonicalize(root).unwrap()
         );
     }
 
