@@ -1,7 +1,8 @@
 #![cfg(windows)]
 
 use meta_rust_cli::{
-    execute_command_with_host_capabilities, CommandResult, HOST_CAPABILITY_PLAN_EXECUTION_POLICY_V1,
+    execute_command_with_host_capabilities, PolicyCommandResult,
+    HOST_CAPABILITY_PLAN_EXECUTION_POLICY_V1,
 };
 use std::ffi::OsString;
 use std::process::Command;
@@ -104,7 +105,7 @@ fn planned_command_survives_the_real_cmd_boundary_without_injection() {
         temp.path(),
         &capabilities,
     ) {
-        CommandResult::PlanWithPolicy(commands, _, execution_policy) => {
+        PolicyCommandResult::PlanWithPolicy(commands, _, execution_policy) => {
             assert!(!execution_policy.expand_loop_aliases);
             assert!(!execution_policy.apply_host_filters);
             commands.into_iter().next().unwrap()
@@ -171,5 +172,5 @@ fn planned_command_rejects_cmd_line_breaks() {
         temp.path(),
         &capabilities,
     );
-    assert!(matches!(result, CommandResult::Error(message) if message.contains("cmd.exe")));
+    assert!(matches!(result, PolicyCommandResult::Error(message) if message.contains("cmd.exe")));
 }

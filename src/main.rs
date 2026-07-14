@@ -1,7 +1,9 @@
 //! meta-rust subprocess plugin
 
 use meta_plugin_protocol::{
-    run_plugin, CommandResult, PluginDefinition, PluginInfo, PluginRequest,
+    run_plugin_with_capabilities as run_plugin, CommandResultWithPolicy as CommandResult,
+    PluginDefinitionWithCapabilities as PluginDefinition, PluginInfo,
+    PluginRequestWithCapabilities as PluginRequest,
 };
 use std::path::PathBuf;
 

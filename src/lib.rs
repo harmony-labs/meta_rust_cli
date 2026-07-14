@@ -4,8 +4,9 @@
 
 use indexmap::IndexMap;
 pub use meta_plugin_protocol::{
-    output_execution_plan, CommandResult, ExecutionPlan, PlanExecutionPolicy, PlanResponse,
-    PlannedCommand, PluginHelp, HOST_CAPABILITY_PLAN_EXECUTION_POLICY_V1,
+    output_execution_plan, CommandResult, CommandResultWithPolicy as PolicyCommandResult,
+    ExecutionPlan, PlanExecutionPolicy, PlanResponse, PlanResponseWithPolicy, PlannedCommand,
+    PluginHelp, HOST_CAPABILITY_PLAN_EXECUTION_POLICY_V1,
 };
 #[cfg(not(windows))]
 use std::borrow::Cow;
@@ -352,8 +353,8 @@ fn serialize_shell_command(tokens: &[String]) -> Result<String, &'static str> {
 ///
 /// If `provided_projects` is not empty, it will be used instead of reading from .meta file.
 /// This allows meta_cli to pass in the full project list when --recursive is used.
-/// Operational commands fail closed because this legacy entry point cannot
-/// negotiate the host's plan execution policy; plugin help remains available.
+/// This compatibility entry point returns the legacy result shape. Capability-
+/// aware plugin hosts should use [`execute_command_with_host_capabilities`].
 pub fn execute_command(
     command: &str,
     args: &[String],
@@ -361,7 +362,7 @@ pub fn execute_command(
     provided_projects: &[String],
     cwd: &Path,
 ) -> CommandResult {
-    execute_command_with_filters(
+    into_legacy_result(execute_command_with_filters(
         command,
         args,
         parallel,
@@ -369,8 +370,23 @@ pub fn execute_command(
         cwd,
         None,
         None,
-        &[],
-    )
+        &[HOST_CAPABILITY_PLAN_EXECUTION_POLICY_V1.to_string()],
+    ))
+}
+
+fn into_legacy_result(result: PolicyCommandResult) -> CommandResult {
+    match result {
+        PolicyCommandResult::Plan(commands, parallel)
+        | PolicyCommandResult::PlanWithPolicy(commands, parallel, _) => {
+            CommandResult::Plan(commands, parallel)
+        }
+        PolicyCommandResult::FullPlan(plan) | PolicyCommandResult::FullPlanWithPolicy(plan, _) => {
+            CommandResult::FullPlan(plan)
+        }
+        PolicyCommandResult::Message(message) => CommandResult::Message(message),
+        PolicyCommandResult::Error(error) => CommandResult::Error(error),
+        PolicyCommandResult::ShowHelp(error) => CommandResult::ShowHelp(error),
+    }
 }
 
 /// Execute a Rust/Cargo command after negotiating host execution behavior.
@@ -381,7 +397,7 @@ pub fn execute_command_with_host_capabilities(
     provided_projects: &[String],
     cwd: &Path,
     host_capabilities: &[String],
-) -> CommandResult {
+) -> PolicyCommandResult {
     execute_command_with_filters(
         command,
         args,
@@ -405,11 +421,11 @@ pub fn execute_command_with_filters(
     include_filters: Option<&[String]>,
     exclude_filters: Option<&[String]>,
     host_capabilities: &[String],
-) -> CommandResult {
+) -> PolicyCommandResult {
     let mut command_parts = command.split_whitespace();
     let namespace = command_parts.next().unwrap_or_default();
     if !matches!(namespace, "cargo" | "rust") {
-        return CommandResult::ShowHelp(Some(format!(
+        return PolicyCommandResult::ShowHelp(Some(format!(
             "unrecognized Rust plugin namespace '{command}'"
         )));
     }
@@ -422,14 +438,14 @@ pub fn execute_command_with_filters(
     // Help is Meta-aware and deliberately side-effect-free. Cargo/test-binary
     // payload after `--` is opaque and must never be interpreted here.
     if cargo_args.is_empty() || help_requested(&cargo_args) {
-        return CommandResult::ShowHelp(None);
+        return PolicyCommandResult::ShowHelp(None);
     }
 
     if !host_capabilities
         .iter()
         .any(|capability| capability == HOST_CAPABILITY_PLAN_EXECUTION_POLICY_V1)
     {
-        return CommandResult::Error(format!(
+        return PolicyCommandResult::Error(format!(
             "Cargo operations require host capability '{HOST_CAPABILITY_PLAN_EXECUTION_POLICY_V1}'"
         ));
     }
@@ -437,7 +453,9 @@ pub fn execute_command_with_filters(
     // Get all project directories
     let dirs = match get_project_directories(provided_projects, cwd) {
         Ok(d) => d,
-        Err(e) => return CommandResult::Error(format!("Failed to get project directories: {e}")),
+        Err(e) => {
+            return PolicyCommandResult::Error(format!("Failed to get project directories: {e}"));
+        }
     };
 
     // Apply the host-selected scope before filtering to Rust projects so an
@@ -446,7 +464,9 @@ pub fn execute_command_with_filters(
     let rust_dirs = filter_rust_projects(&selected_dirs);
 
     if rust_dirs.is_empty() {
-        return CommandResult::Message("No Rust projects found (no Cargo.toml files)".to_string());
+        return PolicyCommandResult::Message(
+            "No Rust projects found (no Cargo.toml files)".to_string(),
+        );
     }
 
     // Cargo owns subcommand validation, aliases, and installed cargo-* tools.
@@ -457,7 +477,7 @@ pub fn execute_command_with_filters(
     cargo_tokens.extend(cargo_args);
     let cargo_cmd = match serialize_shell_command(&cargo_tokens) {
         Ok(command) => command,
-        Err(error) => return CommandResult::Error(error.to_string()),
+        Err(error) => return PolicyCommandResult::Error(error.to_string()),
     };
     let cargo_env = shell_transport_environment(&cargo_tokens);
 
@@ -471,7 +491,7 @@ pub fn execute_command_with_filters(
         })
         .collect();
 
-    CommandResult::PlanWithPolicy(
+    PolicyCommandResult::PlanWithPolicy(
         commands,
         Some(parallel),
         PlanExecutionPolicy {
@@ -511,6 +531,19 @@ pub fn plugin_help() -> PluginHelp {
     }
 }
 
+/// Get the legacy plain-text help representation for library callers.
+pub fn get_help_text() -> &'static str {
+    r#"meta rust - Rust/Cargo Plugin
+
+Commands:
+  meta cargo <command>  Run any Cargo command across selected Rust projects
+  meta rust <command>   Alias for the cargo namespace
+
+The plugin selects directories containing Cargo.toml. Cargo validates the
+command and its arguments.
+"#
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,7 +572,7 @@ mod tests {
         parallel: bool,
         provided_projects: &[String],
         cwd: &Path,
-    ) -> CommandResult {
+    ) -> PolicyCommandResult {
         execute_command_with_host_capabilities(
             command,
             args,
@@ -559,7 +592,7 @@ mod tests {
         cwd: &Path,
         include_filters: Option<&[String]>,
         exclude_filters: Option<&[String]>,
-    ) -> CommandResult {
+    ) -> PolicyCommandResult {
         execute_command_with_filters(
             command,
             args,
@@ -572,9 +605,9 @@ mod tests {
         )
     }
 
-    fn expect_plan(result: CommandResult) -> (Vec<PlannedCommand>, Option<bool>) {
+    fn expect_plan(result: PolicyCommandResult) -> (Vec<PlannedCommand>, Option<bool>) {
         match result {
-            CommandResult::PlanWithPolicy(commands, parallel, execution_policy) => {
+            PolicyCommandResult::PlanWithPolicy(commands, parallel, execution_policy) => {
                 assert_eq!(
                     execution_policy,
                     PlanExecutionPolicy {
@@ -611,6 +644,30 @@ mod tests {
         }
         assert!(help.note.as_deref().unwrap().contains("Cargo validates"));
         assert!(!help.note.as_deref().unwrap().contains("meta exec"));
+        assert!(get_help_text().contains("meta cargo <command>"));
+    }
+
+    #[test]
+    fn test_legacy_execute_command_remains_operational() {
+        let temp_dir = TempDir::new().unwrap();
+        create_rust_project(temp_dir.path());
+        let projects = vec![temp_dir.path().to_string_lossy().into_owned()];
+
+        let result = execute_command(
+            "cargo",
+            &strings(&["clean"]),
+            false,
+            &projects,
+            temp_dir.path(),
+        );
+
+        match result {
+            CommandResult::Plan(commands, Some(false)) => {
+                assert_eq!(commands.len(), 1);
+                assert_eq!(commands[0].cmd, "cargo clean");
+            }
+            _ => panic!("Expected legacy Plan result"),
+        }
     }
 
     #[test]
@@ -632,17 +689,18 @@ mod tests {
         create_rust_project(temp_dir.path());
         let projects = vec![temp_dir.path().to_string_lossy().into_owned()];
 
-        let result = execute_command(
+        let result = execute_command_with_host_capabilities(
             "cargo",
             &strings(&["check"]),
             false,
             &projects,
             temp_dir.path(),
+            &[],
         );
 
         assert!(matches!(
             result,
-            CommandResult::Error(message)
+            PolicyCommandResult::Error(message)
                 if message.contains(HOST_CAPABILITY_PLAN_EXECUTION_POLICY_V1)
         ));
     }
@@ -658,7 +716,7 @@ mod tests {
             execute_capable_command("cargo", &strings(&["build"]), false, &[], temp_dir.path());
 
         match result {
-            CommandResult::Message(msg) => assert!(msg.contains("No Rust projects")),
+            PolicyCommandResult::Message(msg) => assert!(msg.contains("No Rust projects")),
             _ => panic!("Expected Message result"),
         }
     }
@@ -828,7 +886,7 @@ mod tests {
         );
         assert!(matches!(
             excluded,
-            CommandResult::Message(message) if message.contains("No Rust projects found")
+            PolicyCommandResult::Message(message) if message.contains("No Rust projects found")
         ));
     }
 
@@ -856,7 +914,7 @@ mod tests {
         );
         assert!(matches!(
             include_docs,
-            CommandResult::Message(message) if message.contains("No Rust projects found")
+            PolicyCommandResult::Message(message) if message.contains("No Rust projects found")
         ));
 
         let exclude_filters = vec![root.to_string_lossy().into_owned()];
@@ -871,7 +929,7 @@ mod tests {
         );
         assert!(matches!(
             exclude_all,
-            CommandResult::Message(message) if message.contains("No Rust projects found")
+            PolicyCommandResult::Message(message) if message.contains("No Rust projects found")
         ));
     }
 
@@ -1090,7 +1148,7 @@ mod tests {
             max_parallel: None,
             spawn_stagger_ms: None,
         };
-        let response = PlanResponse {
+        let response = PlanResponseWithPolicy {
             plan,
             execution_policy: PlanExecutionPolicy {
                 expand_loop_aliases: false,
