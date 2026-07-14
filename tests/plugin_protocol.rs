@@ -1,6 +1,21 @@
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
+#[test]
+fn discovery_declares_bare_namespace_help() {
+    let output = Command::new(env!("CARGO_BIN_EXE_meta-rust"))
+        .arg("--meta-plugin-info")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let info: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        info["bare_help_commands"],
+        serde_json::json!(["cargo", "rust"])
+    );
+}
+
 fn invoke_plugin(request: &str) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_meta-rust"))
         .arg("--meta-plugin-exec")

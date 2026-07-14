@@ -16,6 +16,7 @@ fn main() {
             description: Some("Cargo commands for Meta workspaces".to_string()),
             help: Some(meta_rust_cli::plugin_help()),
         },
+        bare_help_commands: vec!["cargo".to_string(), "rust".to_string()],
         execute,
     });
 }
