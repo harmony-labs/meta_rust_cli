@@ -184,6 +184,21 @@ const WINDOWS_NUL_ERROR: &str =
     "Cargo arguments containing NUL bytes cannot be transported through cmd.exe";
 #[cfg(any(windows, test))]
 const WINDOWS_LITERAL_PERCENT_ENV: &str = "META_RUST_PCT";
+#[cfg(any(windows, test))]
+const WINDOWS_LITERAL_QUOTE_ENV: &str = "META_RUST_Q";
+
+#[cfg(any(windows, test))]
+fn windows_cmd_token_needs_quotes(token: &str) -> bool {
+    const UNQUOTED: &str = r"#$*+-./:?@\_";
+
+    token.is_empty()
+        || token.ends_with('\\')
+        || token.chars().any(|ch| {
+            let ascii_needs_quotes =
+                ch.is_ascii() && !(ch.is_ascii_alphanumeric() || UNQUOTED.contains(ch));
+            ascii_needs_quotes || ch.is_control()
+        })
+}
 
 #[cfg(any(windows, test))]
 fn quote_windows_cmd_token(token: &str) -> Result<String, &'static str> {
@@ -203,18 +218,13 @@ fn quote_windows_cmd_token(token: &str) -> Result<String, &'static str> {
         return Err(WINDOWS_NEWLINE_ERROR);
     }
 
-    const UNQUOTED: &str = r"#$*+-./:?@\_";
-    let quote = token.is_empty()
-        || token.ends_with('\\')
-        || token.chars().any(|ch| {
-            let ascii_needs_quotes =
-                ch.is_ascii() && !(ch.is_ascii_alphanumeric() || UNQUOTED.contains(ch));
-            ascii_needs_quotes || ch.is_control()
-        });
+    let quote = windows_cmd_token_needs_quotes(token);
 
     let mut escaped = String::with_capacity(token.len() + 2);
     if quote {
-        escaped.push('"');
+        escaped.push('%');
+        escaped.push_str(WINDOWS_LITERAL_QUOTE_ENV);
+        escaped.push('%');
     }
 
     let mut backslashes = 0;
@@ -227,9 +237,16 @@ fn quote_windows_cmd_token(token: &str) -> Result<String, &'static str> {
 
         if ch == '"' {
             // Add n backslashes to the n already emitted, then add the first
-            // of a doubled quote pair. The ordinary push below adds the second.
+            // of a doubled quote pair. Fixed environment references defer the
+            // actual quote characters until cmd parses the command string.
             escaped.extend(std::iter::repeat_n('\\', backslashes));
-            escaped.push('"');
+            for _ in 0..2 {
+                escaped.push('%');
+                escaped.push_str(WINDOWS_LITERAL_QUOTE_ENV);
+                escaped.push('%');
+            }
+            backslashes = 0;
+            continue;
         } else if ch == '%' {
             escaped.push('%');
             escaped.push_str(WINDOWS_LITERAL_PERCENT_ENV);
@@ -245,7 +262,9 @@ fn quote_windows_cmd_token(token: &str) -> Result<String, &'static str> {
         // A quoted argument's trailing backslashes must be doubled so they do
         // not consume the closing quote in the receiving CRT argv parser.
         escaped.extend(std::iter::repeat_n('\\', backslashes));
-        escaped.push('"');
+        escaped.push('%');
+        escaped.push_str(WINDOWS_LITERAL_QUOTE_ENV);
+        escaped.push('%');
     }
     Ok(escaped)
 }
@@ -254,11 +273,20 @@ fn quote_windows_cmd_token(token: &str) -> Result<String, &'static str> {
 fn windows_shell_transport_environment(
     tokens: &[String],
 ) -> Option<std::collections::HashMap<String, String>> {
-    tokens.iter().any(|token| token.contains('%')).then(|| {
-        std::collections::HashMap::from([(
-            WINDOWS_LITERAL_PERCENT_ENV.to_string(),
-            "%".to_string(),
-        )])
+    let needs_percent = tokens.iter().any(|token| token.contains('%'));
+    let needs_quote = tokens
+        .iter()
+        .any(|token| windows_cmd_token_needs_quotes(token));
+
+    (needs_percent || needs_quote).then(|| {
+        let mut environment = std::collections::HashMap::new();
+        if needs_percent {
+            environment.insert(WINDOWS_LITERAL_PERCENT_ENV.to_string(), "%".to_string());
+        }
+        if needs_quote {
+            environment.insert(WINDOWS_LITERAL_QUOTE_ENV.to_string(), "\"".to_string());
+        }
+        environment
     })
 }
 
@@ -294,19 +322,7 @@ fn serialize_shell_command(tokens: &[String]) -> Result<String, &'static str> {
         .iter()
         .map(|token| quote_shell_token(token))
         .collect::<Result<Vec<_>, _>>()?;
-    let command = quoted.join(" ");
-
-    #[cfg(windows)]
-    {
-        // loop_lib passes the complete plan as one `cmd.exe /c` argument.
-        // When that argument contains inner quotes, cmd needs one additional
-        // outer pair to strip before it interprets the inner argument quotes.
-        if command.contains('"') {
-            return Ok(format!("\"{command}\""));
-        }
-    }
-
-    Ok(command)
+    Ok(quoted.join(" "))
 }
 
 /// Execute a Rust/Cargo command and return the result
@@ -708,29 +724,32 @@ mod tests {
         assert_eq!(quote_windows_cmd_token("plain").unwrap(), "plain");
         assert_eq!(
             quote_windows_cmd_token("amp&ersand").unwrap(),
-            "\"amp&ersand\""
+            "%META_RUST_Q%amp&ersand%META_RUST_Q%"
         );
         assert_eq!(
             quote_windows_cmd_token("pipe|value").unwrap(),
-            "\"pipe|value\""
+            "%META_RUST_Q%pipe|value%META_RUST_Q%"
         );
         assert_eq!(
             quote_windows_cmd_token("trailing&\\").unwrap(),
-            "\"trailing&\\\\\""
+            "%META_RUST_Q%trailing&\\\\%META_RUST_Q%"
         );
 
         // cmd.exe does not use backslash to escape a quote. Doubling keeps the
         // quote in the argument and leaves the following operator quoted.
         assert_eq!(
             quote_windows_cmd_token("quoted\"&echo injected").unwrap(),
-            "\"quoted\"\"&echo injected\""
+            "%META_RUST_Q%quoted%META_RUST_Q%%META_RUST_Q%&echo injected%META_RUST_Q%"
         );
 
         // Literal percent pairs are reconstructed from one controlled
         // expansion and cannot become arbitrary environment-variable syntax.
         let percent = quote_windows_cmd_token("%PATH%").unwrap();
-        assert_eq!(percent, "\"%META_RUST_PCT%PATH%META_RUST_PCT%\"");
-        assert_ne!(percent, "\"%PATH%\"");
+        assert_eq!(
+            percent,
+            "%META_RUST_Q%%META_RUST_PCT%PATH%META_RUST_PCT%%META_RUST_Q%"
+        );
+        assert_ne!(percent, "%META_RUST_Q%%PATH%%META_RUST_Q%");
 
         let tokens = vec!["cargo".to_string(), "%PATH%".to_string()];
         let environment = windows_shell_transport_environment(&tokens).unwrap();
@@ -740,12 +759,18 @@ mod tests {
                 .map(String::as_str),
             Some("%")
         );
+        assert_eq!(
+            environment
+                .get(WINDOWS_LITERAL_QUOTE_ENV)
+                .map(String::as_str),
+            Some("\"")
+        );
 
         #[cfg(windows)]
         assert_eq!(
             serialize_shell_command(&["cargo".to_string(), "value with spaces".to_string()])
                 .unwrap(),
-            "\"cargo \"value with spaces\"\""
+            "cargo %META_RUST_Q%value with spaces%META_RUST_Q%"
         );
     }
 

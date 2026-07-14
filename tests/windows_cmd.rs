@@ -72,6 +72,7 @@ fn planned_command_survives_the_real_cmd_boundary_without_injection() {
         "%hello".to_string(),
         "%%cd:~,%".to_string(),
         "%META_RUST_PCT%".to_string(),
+        "%META_RUST_Q%".to_string(),
         "%CD%".to_string(),
         "%0".to_string(),
         "%%%%".to_string(),
@@ -82,6 +83,7 @@ fn planned_command_survives_the_real_cmd_boundary_without_injection() {
         "caret^value".to_string(),
         "paren(value)".to_string(),
         "quoted\"&echo injected".to_string(),
+        "quoted\"%PATH%&value".to_string(),
         "trailing\\".to_string(),
         "bang!PATH!".to_string(),
         "semi;colon".to_string(),
@@ -95,6 +97,10 @@ fn planned_command_survives_the_real_cmd_boundary_without_injection() {
         CommandResult::Plan(commands, _) => commands.into_iter().next().unwrap(),
         _ => panic!("expected a Cargo execution plan"),
     };
+    assert!(
+        !planned.cmd.contains('"'),
+        "literal quotes must be deferred until cmd expansion"
+    );
 
     let mut path_entries = vec![cargo.parent().unwrap().to_path_buf()];
     path_entries.extend(std::env::split_paths(
@@ -107,7 +113,8 @@ fn planned_command_survives_the_real_cmd_boundary_without_injection() {
         .arg(&planned.cmd)
         .current_dir(temp.path())
         .env("PATH", path)
-        .env("META_RUST_PCT", &injection);
+        .env("META_RUST_PCT", &injection)
+        .env("META_RUST_Q", &injection);
     if let Some(environment) = &planned.env {
         process.envs(environment);
     }
