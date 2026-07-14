@@ -2,52 +2,225 @@
 //!
 //! Provides Rust/Cargo commands for meta repositories.
 
+use indexmap::IndexMap;
 pub use meta_plugin_protocol::{
-    output_execution_plan, CommandResult, ExecutionPlan, PlanResponse, PlannedCommand,
+    output_execution_plan, CommandResult, ExecutionPlan, PlanResponse, PlannedCommand, PluginHelp,
 };
-use std::path::Path;
+#[cfg(not(windows))]
+use std::borrow::Cow;
+use std::collections::HashSet;
+use std::path::{Component, Path, PathBuf};
 
-/// Get all project directories from .meta config (including root ".")
-/// If provided_projects is not empty, uses that list instead (for --recursive support)
+/// Normalize project paths without requiring them to exist.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    normalized
+}
+
+/// Normalize and deduplicate paths while preserving their first-seen order.
+fn normalize_project_directories(paths: &[String], cwd: &Path) -> Vec<String> {
+    let base = if cwd.is_absolute() {
+        cwd.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(cwd)
+    };
+    let mut seen = HashSet::new();
+
+    paths
+        .iter()
+        .filter_map(|path| {
+            let path = Path::new(path);
+            let absolute = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                base.join(path)
+            };
+            // Resolve the original path before lexically collapsing `..`.
+            // Filesystem traversal through `symlink/..` is not necessarily
+            // equivalent to removing both components textually.
+            let normalized = std::fs::canonicalize(&absolute).unwrap_or_else(|_| {
+                let lexical = normalize_path(&absolute);
+                std::fs::canonicalize(&lexical).unwrap_or(lexical)
+            });
+
+            if seen.insert(normalized.clone()) {
+                Some(normalized.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Get normalized project directories from the host or local Meta config.
+///
+/// If `provided_projects` is non-empty, that list is authoritative.
 fn get_project_directories(
     provided_projects: &[String],
     cwd: &Path,
 ) -> anyhow::Result<Vec<String>> {
-    // If we have provided projects from meta_cli (e.g., when --recursive is used), use them
+    // A host-supplied project list already includes the Meta root and reflects
+    // recursion, worktree selection, and tag filtering. Treat it as authoritative;
+    // include/exclude filters are applied below before Rust-project detection.
     if !provided_projects.is_empty() {
-        // Include root "." plus all provided project paths
-        let mut dirs = vec![".".to_string()];
-        for p in provided_projects {
-            dirs.push(p.clone());
-        }
-        return Ok(dirs);
+        return Ok(normalize_project_directories(provided_projects, cwd));
     }
 
     // Use canonical config parsing (supports JSON + YAML)
     let tree = match meta_core::config::walk_meta_tree(cwd, Some(0)) {
         Ok(t) => t,
-        Err(_) => return Ok(vec![".".to_string()]),
+        Err(_) => {
+            return Ok(normalize_project_directories(&[".".to_string()], cwd));
+        }
     };
     let mut dirs = vec![".".to_string()];
     let mut paths: Vec<String> = tree.iter().map(|n| n.info.path.clone()).collect();
     paths.sort();
     dirs.extend(paths);
-    Ok(dirs)
+    Ok(normalize_project_directories(&dirs, cwd))
 }
 
 /// Filter directories to only those with Cargo.toml
-fn filter_rust_projects(dirs: &[String], cwd: &Path) -> Vec<String> {
+fn filter_rust_projects(dirs: &[String]) -> Vec<String> {
     dirs.iter()
-        .filter(|dir| {
-            let cargo_path = if *dir == "." {
-                cwd.join("Cargo.toml")
-            } else {
-                cwd.join(dir).join("Cargo.toml")
-            };
-            cargo_path.exists()
-        })
+        .filter(|dir| Path::new(dir).join("Cargo.toml").is_file())
         .cloned()
         .collect()
+}
+
+/// Apply the host's directory selection before deciding whether the scope has
+/// any Rust projects. loop_lib applies the same filters during execution, but
+/// planning must see the selected scope to produce a clear empty result.
+fn filter_selected_projects(
+    dirs: &[String],
+    include_filters: Option<&[String]>,
+    exclude_filters: Option<&[String]>,
+) -> Vec<String> {
+    let mut selected = dirs.to_vec();
+
+    if let Some(includes) = include_filters.filter(|filters| !filters.is_empty()) {
+        selected.retain(|path| includes.iter().any(|filter| path.contains(filter)));
+    }
+
+    if let Some(excludes) = exclude_filters.filter(|filters| !filters.is_empty()) {
+        selected.retain(|path| {
+            !excludes
+                .iter()
+                .map(|filter| filter.trim_end_matches('/'))
+                .any(|filter| path.contains(filter))
+        });
+    }
+
+    selected
+}
+
+fn help_requested(args: &[String]) -> bool {
+    args.iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+}
+
+#[cfg(any(windows, test))]
+const WINDOWS_NEWLINE_ERROR: &str =
+    "Cargo arguments containing carriage returns or newlines cannot be transported safely through cmd.exe";
+#[cfg(any(windows, test))]
+const WINDOWS_NUL_ERROR: &str =
+    "Cargo arguments containing NUL bytes cannot be transported through cmd.exe";
+
+#[cfg(any(windows, test))]
+fn quote_windows_cmd_token(token: &str) -> Result<String, &'static str> {
+    // This follows Rust's hardened batch-argument encoding. cmd.exe does not
+    // understand the CRT-style `\\\"` quote emitted by generic Windows argv
+    // serializers, so embedded quotes must instead be doubled. Quote a broad
+    // denylist of ASCII syntax to keep cmd metacharacters inside the argument.
+    //
+    // cmd has no direct escape for a literal `%` on a `/C` command line. The
+    // zero-length `%cd:~,%` expansion prevents the two user-supplied percent
+    // signs in `%NAME%` from ever forming an environment-variable reference.
+    // Command extensions are enabled by default for a fresh cmd.exe process.
+    if token.contains('\0') {
+        return Err(WINDOWS_NUL_ERROR);
+    }
+    if token.contains(['\r', '\n']) {
+        return Err(WINDOWS_NEWLINE_ERROR);
+    }
+
+    const UNQUOTED: &str = r"#$*+-./:?@\_";
+    let quote = token.is_empty()
+        || token.ends_with('\\')
+        || token.chars().any(|ch| {
+            let ascii_needs_quotes =
+                ch.is_ascii() && !(ch.is_ascii_alphanumeric() || UNQUOTED.contains(ch));
+            ascii_needs_quotes || ch.is_control()
+        });
+
+    let mut escaped = String::with_capacity(token.len() + 2);
+    if quote {
+        escaped.push('"');
+    }
+
+    let mut backslashes = 0;
+    for ch in token.chars() {
+        if ch == '\\' {
+            backslashes += 1;
+            escaped.push(ch);
+            continue;
+        }
+
+        if ch == '"' {
+            // Add n backslashes to the n already emitted, then add the first
+            // of a doubled quote pair. The ordinary push below adds the second.
+            escaped.extend(std::iter::repeat_n('\\', backslashes));
+            escaped.push('"');
+        } else if ch == '%' {
+            escaped.push_str("%%cd:~,%");
+        }
+        backslashes = 0;
+        escaped.push(ch);
+    }
+
+    if quote {
+        // A quoted argument's trailing backslashes must be doubled so they do
+        // not consume the closing quote in the receiving CRT argv parser.
+        escaped.extend(std::iter::repeat_n('\\', backslashes));
+        escaped.push('"');
+    }
+    Ok(escaped)
+}
+
+fn quote_shell_token(token: &str) -> Result<String, &'static str> {
+    #[cfg(windows)]
+    {
+        quote_windows_cmd_token(token)
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(shell_escape::unix::escape(Cow::Borrowed(token)).into_owned())
+    }
+}
+
+fn serialize_shell_command(tokens: &[String]) -> Result<String, &'static str> {
+    let quoted = tokens
+        .iter()
+        .map(|token| quote_shell_token(token))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(quoted.join(" "))
 }
 
 /// Execute a Rust/Cargo command and return the result
@@ -61,12 +234,35 @@ pub fn execute_command(
     provided_projects: &[String],
     cwd: &Path,
 ) -> CommandResult {
-    // Intercept --help/-h before dispatching to subcommand handlers
-    if command
-        .split_whitespace()
-        .chain(args.iter().map(String::as_str))
-        .any(|a| a == "--help" || a == "-h")
-    {
+    execute_command_with_filters(command, args, parallel, provided_projects, cwd, None, None)
+}
+
+/// Execute a Rust/Cargo command with the host's selected directory filters.
+pub fn execute_command_with_filters(
+    command: &str,
+    args: &[String],
+    parallel: bool,
+    provided_projects: &[String],
+    cwd: &Path,
+    include_filters: Option<&[String]>,
+    exclude_filters: Option<&[String]>,
+) -> CommandResult {
+    let mut command_parts = command.split_whitespace();
+    let namespace = command_parts.next().unwrap_or_default();
+    if !matches!(namespace, "cargo" | "rust") {
+        return CommandResult::ShowHelp(Some(format!(
+            "unrecognized Rust plugin namespace '{command}'"
+        )));
+    }
+
+    // Older hosts may send a multi-word matched command. New hosts advertise
+    // only the namespace and send every following token in `args`.
+    let mut cargo_args: Vec<String> = command_parts.map(str::to_owned).collect();
+    cargo_args.extend(args.iter().cloned());
+
+    // Help is Meta-aware and deliberately side-effect-free. Cargo/test-binary
+    // payload after `--` is opaque and must never be interpreted here.
+    if cargo_args.is_empty() || help_requested(&cargo_args) {
         return CommandResult::ShowHelp(None);
     }
 
@@ -76,32 +272,24 @@ pub fn execute_command(
         Err(e) => return CommandResult::Error(format!("Failed to get project directories: {e}")),
     };
 
-    // Filter to Rust projects only
-    let rust_dirs = filter_rust_projects(&dirs, cwd);
+    // Apply the host-selected scope before filtering to Rust projects so an
+    // include/exclude selection containing no Cargo.toml gets a clear result.
+    let selected_dirs = filter_selected_projects(&dirs, include_filters, exclude_filters);
+    let rust_dirs = filter_rust_projects(&selected_dirs);
 
     if rust_dirs.is_empty() {
         return CommandResult::Message("No Rust projects found (no Cargo.toml files)".to_string());
     }
 
-    // Build the cargo command
-    let cargo_cmd = match command {
-        "cargo build" | "rust build" => {
-            let mut cmd = "cargo build".to_string();
-            for arg in args {
-                cmd.push(' ');
-                cmd.push_str(arg);
-            }
-            cmd
-        }
-        "cargo test" | "rust test" => {
-            let mut cmd = "cargo test".to_string();
-            for arg in args {
-                cmd.push(' ');
-                cmd.push_str(arg);
-            }
-            cmd
-        }
-        _ => return CommandResult::ShowHelp(Some(format!("unrecognized command '{command}'"))),
+    // Cargo owns subcommand validation, aliases, and installed cargo-* tools.
+    // Serialize each argv token independently because loop_lib executes the
+    // string plan through the platform shell.
+    let mut cargo_tokens = Vec::with_capacity(cargo_args.len() + 1);
+    cargo_tokens.push("cargo".to_string());
+    cargo_tokens.extend(cargo_args);
+    let cargo_cmd = match serialize_shell_command(&cargo_tokens) {
+        Ok(command) => command,
+        Err(error) => return CommandResult::Error(error.to_string()),
     };
 
     // Build execution plan
@@ -117,17 +305,34 @@ pub fn execute_command(
     CommandResult::Plan(commands, Some(parallel))
 }
 
-/// Get help text for the plugin
-pub fn get_help_text() -> &'static str {
-    r#"meta rust - Rust/Cargo Plugin
+/// Build the structured runtime help advertised by the plugin.
+pub fn plugin_help() -> PluginHelp {
+    let mut commands = IndexMap::new();
+    commands.insert(
+        "cargo".to_string(),
+        "Run any Cargo command across selected Rust projects".to_string(),
+    );
+    commands.insert(
+        "rust".to_string(),
+        "Alias for the cargo namespace".to_string(),
+    );
 
-Commands:
-  meta cargo build   Run cargo build across all Rust projects
-  meta cargo test    Run cargo test across all Rust projects
-
-This plugin detects Rust projects (by presence of Cargo.toml) and runs
-the specified cargo command. Non-Rust directories are skipped.
-"#
+    PluginHelp {
+        usage: "meta [META OPTIONS] cargo <command> [cargo args...]\n       meta [META OPTIONS] rust <command> [cargo args...]".to_string(),
+        commands,
+        command_sections: IndexMap::new(),
+        examples: vec![
+            "meta cargo clean".to_string(),
+            "meta --dry-run cargo clean --recursive".to_string(),
+            "meta cargo check --all-targets".to_string(),
+            "meta cargo clippy --all-targets -- -D warnings".to_string(),
+            "meta cargo nextest run".to_string(),
+        ],
+        note: Some(
+            "Meta selects and loops over directories containing Cargo.toml; Cargo validates the command and its arguments. Put Meta controls before cargo/rust. Use `cargo help <command>` for command-specific Cargo options."
+                .to_string(),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -135,20 +340,62 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_unknown_command() {
-        let result = execute_command("cargo unknown", &[], false, &[], Path::new("."));
+    fn create_rust_project(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::write(
+            path.join("Cargo.toml"),
+            "[package]\nname = \"test-project\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn expect_plan(result: CommandResult) -> (Vec<PlannedCommand>, Option<bool>) {
         match result {
-            CommandResult::ShowHelp(Some(msg)) => assert!(msg.contains("unrecognized command")),
+            CommandResult::Plan(commands, parallel) => (commands, parallel),
+            _ => panic!("Expected Plan result"),
+        }
+    }
+
+    #[test]
+    fn test_non_cargo_namespace_is_rejected() {
+        let result = execute_command("carg", &strings(&["clean"]), false, &[], Path::new("."));
+        match result {
+            CommandResult::ShowHelp(Some(msg)) => assert!(msg.contains("unrecognized")),
             _ => panic!("Expected ShowHelp result"),
         }
     }
 
     #[test]
-    fn test_get_help_text() {
-        let help = get_help_text();
-        assert!(help.contains("cargo build"));
-        assert!(help.contains("cargo test"));
+    fn test_plugin_help_describes_general_pass_through() {
+        let help = plugin_help();
+        assert!(help.usage.contains("cargo <command>"));
+        assert!(help.usage.contains("rust <command>"));
+        assert_eq!(
+            help.commands.get("rust").map(String::as_str),
+            Some("Alias for the cargo namespace")
+        );
+        for example in ["clean", "check", "clippy", "nextest"] {
+            assert!(help.examples.iter().any(|line| line.contains(example)));
+        }
+        assert!(help.note.as_deref().unwrap().contains("Cargo validates"));
+        assert!(!help.note.as_deref().unwrap().contains("meta exec"));
+    }
+
+    #[test]
+    fn test_bare_namespace_and_help_do_not_discover_projects() {
+        let missing = Path::new("/path/that/does/not/exist");
+        assert!(matches!(
+            execute_command("cargo", &[], false, &[], missing),
+            CommandResult::ShowHelp(None)
+        ));
+        assert!(matches!(
+            execute_command("rust", &strings(&["clean", "--help"]), false, &[], missing),
+            CommandResult::ShowHelp(None)
+        ));
     }
 
     #[test]
@@ -158,7 +405,7 @@ mod tests {
         // Create .meta with no Rust projects
         std::fs::write(temp_dir.path().join(".meta"), r#"{"projects": {}}"#).unwrap();
 
-        let result = execute_command("cargo build", &[], false, &[], temp_dir.path());
+        let result = execute_command("cargo", &strings(&["build"]), false, &[], temp_dir.path());
 
         match result {
             CommandResult::Message(msg) => assert!(msg.contains("No Rust projects")),
@@ -167,35 +414,272 @@ mod tests {
     }
 
     #[test]
-    fn test_cargo_build_returns_plan() {
+    fn test_cargo_commands_pass_through_without_a_catalog() {
         let temp_dir = TempDir::new().unwrap();
+        create_rust_project(temp_dir.path());
+        let projects = vec![temp_dir.path().to_string_lossy().into_owned()];
 
-        // Create a Cargo.toml in root
-        std::fs::write(
-            temp_dir.path().join("Cargo.toml"),
-            "[package]\nname = \"test\"\n",
-        )
-        .unwrap();
-        std::fs::write(temp_dir.path().join(".meta"), r#"{"projects": {}}"#).unwrap();
+        for expected in [
+            strings(&["cargo", "build", "--release"]),
+            strings(&["cargo", "test", "--workspace"]),
+            strings(&["cargo", "check"]),
+            strings(&["cargo", "clippy", "--all-targets", "--", "-D", "warnings"]),
+            strings(&["cargo", "nextest", "run"]),
+            strings(&["cargo", "definitely-not-a-built-in"]),
+        ] {
+            let (commands, parallel) = expect_plan(execute_command(
+                "cargo",
+                &expected[1..],
+                true,
+                &projects,
+                temp_dir.path(),
+            ));
+            assert_eq!(commands.len(), 1);
+            #[cfg(not(windows))]
+            assert_eq!(shell_words::split(&commands[0].cmd).unwrap(), expected);
+            #[cfg(windows)]
+            assert_eq!(commands[0].cmd, expected.join(" "));
+            assert_eq!(parallel, Some(true));
+        }
+    }
 
-        let result = execute_command(
-            "cargo build",
-            &["--release".to_string()],
-            true,
-            &[],
+    #[test]
+    fn test_rust_alias_produces_canonical_cargo_plan() {
+        let temp_dir = TempDir::new().unwrap();
+        create_rust_project(temp_dir.path());
+        let projects = vec![temp_dir.path().to_string_lossy().into_owned()];
+        let args = strings(&["check", "--all-targets"]);
+
+        let cargo = expect_plan(execute_command(
+            "cargo",
+            &args,
+            false,
+            &projects,
             temp_dir.path(),
+        ));
+        let rust = expect_plan(execute_command(
+            "rust",
+            &args,
+            false,
+            &projects,
+            temp_dir.path(),
+        ));
+
+        assert_eq!(cargo.0[0].cmd, "cargo check --all-targets");
+        assert_eq!(cargo.0[0].cmd, rust.0[0].cmd);
+        assert_eq!(cargo.0[0].dir, rust.0[0].dir);
+    }
+
+    #[test]
+    fn test_host_projects_are_authoritative_normalized_and_deduplicated() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let child = root.join("child");
+        let non_rust = root.join("docs");
+        create_rust_project(root);
+        create_rust_project(&child);
+        std::fs::create_dir_all(&non_rust).unwrap();
+
+        let projects = vec![
+            child.join(".").to_string_lossy().into_owned(),
+            root.join(".").to_string_lossy().into_owned(),
+            root.to_string_lossy().into_owned(),
+            root.join("other/../child").to_string_lossy().into_owned(),
+            non_rust.to_string_lossy().into_owned(),
+        ];
+        let (commands, _) = expect_plan(execute_command(
+            "cargo",
+            &strings(&["clean"]),
+            false,
+            &projects,
+            root,
+        ));
+
+        assert_eq!(commands.len(), 2);
+        assert_eq!(
+            PathBuf::from(&commands[0].dir),
+            std::fs::canonicalize(child).unwrap()
+        );
+        assert_eq!(
+            PathBuf::from(&commands[1].dir),
+            std::fs::canonicalize(root).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_normalization_resolves_symlink_parent_components_before_lexical_cleanup() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().join("root");
+        let external = temp_dir.path().join("external");
+        let anchor = external.join("anchor");
+        let rust_project = external.join("crate");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&anchor).unwrap();
+        create_rust_project(&rust_project);
+        symlink(&anchor, root.join("link")).unwrap();
+
+        let apparent = root.join("link/../crate").to_string_lossy().into_owned();
+        let normalized = normalize_project_directories(&[apparent], &root);
+
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(
+            PathBuf::from(&normalized[0]),
+            std::fs::canonicalize(rust_project).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_host_filters_define_scope_before_rust_detection() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let docs = root.join("docs");
+        create_rust_project(root);
+        std::fs::create_dir_all(&docs).unwrap();
+        let projects = vec![
+            root.to_string_lossy().into_owned(),
+            docs.to_string_lossy().into_owned(),
+        ];
+
+        let include_filters = strings(&["docs"]);
+        let include_docs = execute_command_with_filters(
+            "cargo",
+            &strings(&["check"]),
+            false,
+            &projects,
+            root,
+            Some(&include_filters),
+            None,
+        );
+        assert!(matches!(
+            include_docs,
+            CommandResult::Message(message) if message.contains("No Rust projects found")
+        ));
+
+        let exclude_filters = vec![root.to_string_lossy().into_owned()];
+        let exclude_all = execute_command_with_filters(
+            "cargo",
+            &strings(&["check"]),
+            false,
+            &projects,
+            root,
+            None,
+            Some(&exclude_filters),
+        );
+        assert!(matches!(
+            exclude_all,
+            CommandResult::Message(message) if message.contains("No Rust projects found")
+        ));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_shell_serialization_preserves_argument_boundaries() {
+        let temp_dir = TempDir::new().unwrap();
+        create_rust_project(temp_dir.path());
+        let projects = vec![temp_dir.path().to_string_lossy().into_owned()];
+        let args = strings(&[
+            "clippy",
+            "--",
+            "value with spaces",
+            "$(touch injected)",
+            "semi;colon",
+            "amp&ersand",
+            "single'quote",
+            "",
+        ]);
+
+        let (commands, _) = expect_plan(execute_command(
+            "cargo",
+            &args,
+            false,
+            &projects,
+            temp_dir.path(),
+        ));
+        let mut expected = vec!["cargo".to_string()];
+        expected.extend(args);
+
+        assert_eq!(shell_words::split(&commands[0].cmd).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_windows_cmd_serialization_uses_cmd_native_escaping() {
+        assert_eq!(quote_windows_cmd_token("plain").unwrap(), "plain");
+        assert_eq!(
+            quote_windows_cmd_token("amp&ersand").unwrap(),
+            "\"amp&ersand\""
+        );
+        assert_eq!(
+            quote_windows_cmd_token("pipe|value").unwrap(),
+            "\"pipe|value\""
+        );
+        assert_eq!(
+            quote_windows_cmd_token("trailing&\\").unwrap(),
+            "\"trailing&\\\\\""
         );
 
-        match result {
-            CommandResult::Plan(commands, parallel) => {
-                assert_eq!(commands.len(), 1);
-                assert_eq!(commands[0].dir, ".");
-                assert!(commands[0].cmd.contains("cargo build"));
-                assert!(commands[0].cmd.contains("--release"));
-                assert_eq!(parallel, Some(true));
-            }
-            _ => panic!("Expected Plan result"),
+        // cmd.exe does not use backslash to escape a quote. Doubling keeps the
+        // quote in the argument and leaves the following operator quoted.
+        assert_eq!(
+            quote_windows_cmd_token("quoted\"&echo injected").unwrap(),
+            "\"quoted\"\"&echo injected\""
+        );
+
+        // Literal percent pairs must not become environment-variable syntax.
+        let percent = quote_windows_cmd_token("%PATH%").unwrap();
+        assert_eq!(percent, "\"%%cd:~,%%PATH%%cd:~,%%\"");
+        assert_ne!(percent, "\"%PATH%\"");
+    }
+
+    #[test]
+    fn test_windows_cmd_serialization_rejects_line_breaks() {
+        for token in ["line\nfeed", "carriage\rreturn", "both\r\n"] {
+            assert_eq!(quote_windows_cmd_token(token), Err(WINDOWS_NEWLINE_ERROR));
         }
+        assert_eq!(quote_windows_cmd_token("nul\0byte"), Err(WINDOWS_NUL_ERROR));
+    }
+
+    #[test]
+    fn test_help_and_meta_like_tokens_after_separator_are_cargo_payload() {
+        let temp_dir = TempDir::new().unwrap();
+        create_rust_project(temp_dir.path());
+        let projects = vec![temp_dir.path().to_string_lossy().into_owned()];
+        let args = strings(&["test", "--", "--recursive", "--help"]);
+
+        let (commands, _) = expect_plan(execute_command(
+            "cargo",
+            &args,
+            false,
+            &projects,
+            temp_dir.path(),
+        ));
+
+        #[cfg(not(windows))]
+        assert_eq!(
+            shell_words::split(&commands[0].cmd).unwrap(),
+            strings(&["cargo", "test", "--", "--recursive", "--help"])
+        );
+        #[cfg(windows)]
+        assert_eq!(commands[0].cmd, "cargo test -- --recursive --help");
+    }
+
+    #[test]
+    fn test_multi_word_command_shape_remains_compatible() {
+        let temp_dir = TempDir::new().unwrap();
+        create_rust_project(temp_dir.path());
+        let projects = vec![temp_dir.path().to_string_lossy().into_owned()];
+
+        let (commands, _) = expect_plan(execute_command(
+            "rust build",
+            &strings(&["--release"]),
+            false,
+            &projects,
+            temp_dir.path(),
+        ));
+
+        assert_eq!(commands[0].cmd, "cargo build --release");
     }
 
     #[test]
