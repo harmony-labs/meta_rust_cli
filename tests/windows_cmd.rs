@@ -87,7 +87,7 @@ fn planned_command_survives_the_real_cmd_boundary_without_injection() {
         "semi;colon".to_string(),
         "unicode-λ".to_string(),
         String::new(),
-        injection,
+        injection.clone(),
     ];
     let projects = vec![temp.path().to_string_lossy().into_owned()];
 
