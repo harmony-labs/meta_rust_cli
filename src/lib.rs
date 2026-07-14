@@ -294,7 +294,19 @@ fn serialize_shell_command(tokens: &[String]) -> Result<String, &'static str> {
         .iter()
         .map(|token| quote_shell_token(token))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(quoted.join(" "))
+    let command = quoted.join(" ");
+
+    #[cfg(windows)]
+    {
+        // loop_lib passes the complete plan as one `cmd.exe /c` argument.
+        // When that argument contains inner quotes, cmd needs one additional
+        // outer pair to strip before it interprets the inner argument quotes.
+        if command.contains('"') {
+            return Ok(format!("\"{command}\""));
+        }
+    }
+
+    Ok(command)
 }
 
 /// Execute a Rust/Cargo command and return the result
@@ -727,6 +739,13 @@ mod tests {
                 .get(WINDOWS_LITERAL_PERCENT_ENV)
                 .map(String::as_str),
             Some("%")
+        );
+
+        #[cfg(windows)]
+        assert_eq!(
+            serialize_shell_command(&["cargo".to_string(), "value with spaces".to_string()])
+                .unwrap(),
+            "\"cargo \"value with spaces\"\""
         );
     }
 
